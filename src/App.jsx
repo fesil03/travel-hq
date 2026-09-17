@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import {
   Plane, BedDouble, CalendarDays, CloudSun, Luggage, LayoutGrid, Wallet, Plus, Trash2,
   Sparkles, Check, ChevronDown, ChevronRight, AlertTriangle, CheckCircle2, Info, Loader2,
-  RefreshCw, ArrowLeftRight, XCircle, ExternalLink, Cloud, CloudOff, Download, Upload,
+  RefreshCw, ArrowLeftRight, XCircle, ExternalLink, Cloud, CloudOff, Download, Upload, CarFront,
 } from "lucide-react";
 import {
   getDevice, setDevice, syncConfigured, loadLocal, saveLocal, getMeta, setMeta,
@@ -67,6 +67,20 @@ const CHANNELS = {
   direct: "Direct with hotel",
   other: "Other site",
 };
+
+// Ground transfers (airport ↔ hotel, between towns). Each mode seeds a
+// pre-trip checklist you can edit; ticking boxes is the whole point.
+const TRANSFER_MODES = {
+  public: ["Public transport", ["Route and line checked", "Transit card or ticket app sorted", "First and last departure times checked", "Offline map saved"]],
+  taxi: ["Taxi", ["Fare estimate noted", "Address saved in the local language", "Cash or local payment ready", "Official taxi rank located"]],
+  app: ["Ride-hailing app", ["App installed and logged in", "Payment method works abroad", "Pickup point found", "Roaming or eSIM working on arrival"]],
+  booked: ["Booked transfer", ["Booked", "Confirmation saved offline", "Pickup time and meeting point confirmed", "Driver or company contact saved", "Paid"]],
+  shuttle: ["Hotel shuttle", ["Requested with the hotel", "Flight details sent", "Meeting point confirmed"]],
+  rental: ["Rental car", ["Booked", "Licence and IDP ready", "Insurance checked", "Pickup location and hours confirmed"]],
+  walk: ["Walk", ["Route saved"]],
+  other: ["Other", []],
+};
+const transferTasks = (mode) => (TRANSFER_MODES[mode]?.[1] || []).map((text) => ({ id: uid(), text, done: false }));
 
 const PACK_CATS = ["Documents", "Tech", "Clothing", "Shoes", "Toiletries", "Other"];
 const BAGS = ["Backpack", "Suitcase", "Wear on travel day"];
@@ -385,9 +399,24 @@ function newTrip(travelers) {
     start, end,
     travelerIds: travelers.map((t) => t.id),
     destinations: [{ id: "d_" + uid(), name: "Destination", start, end }],
-    flights: [], hotels: [], days: {}, weather: {}, packing: [], notes: "",
+    flights: [], hotels: [], transfers: [], days: {}, weather: {}, packing: [], notes: "",
   };
 }
+
+const normTransfer = (o = {}) => ({
+  id: o.id || uid(),
+  destId: o.destId || "",
+  from: o.from || "",
+  to: o.to || "",
+  date: validD(o.date) ? o.date : "",
+  time: o.time || "",
+  mode: TRANSFER_MODES[o.mode] ? o.mode : "taxi",
+  cost: numOrNull(o.cost),
+  currency: CURRENCIES.includes(o.currency) ? o.currency : "USD",
+  link: o.link || "",
+  notes: o.notes || "",
+  tasks: Array.isArray(o.tasks) ? o.tasks.map((t) => ({ id: t.id || uid(), text: t.text || "", done: !!t.done })) : transferTasks(o.mode || "taxi"),
+});
 
 /* ------------------------------------------------------------------ */
 /* Calculations                                                        */
@@ -762,6 +791,7 @@ const SUBTABS = [
   ["overview", "Overview", LayoutGrid],
   ["flights", "Flights", Plane],
   ["hotels", "Hotels", BedDouble],
+  ["transfers", "Transfers", CarFront],
   ["itinerary", "Itinerary", CalendarDays],
   ["weather", "Weather", CloudSun],
   ["packing", "Packing", Luggage],
@@ -828,6 +858,7 @@ function TripView({ trip, state, update, updTrip }) {
       {tab === "overview" && <Overview trip={trip} state={state} update={update} updTrip={updTrip} costs={costs} />}
       {tab === "flights" && <FlightsTab trip={trip} state={state} updTrip={updTrip} />}
       {tab === "hotels" && <HotelsTab trip={trip} state={state} updTrip={updTrip} />}
+      {tab === "transfers" && <TransfersTab trip={trip} state={state} updTrip={updTrip} />}
       {tab === "itinerary" && <ItineraryTab trip={trip} state={state} updTrip={updTrip} />}
       {tab === "weather" && <WeatherTab trip={trip} updTrip={updTrip} />}
       {tab === "packing" && <PackingTab trip={trip} state={state} update={update} updTrip={updTrip} />}
@@ -1355,6 +1386,187 @@ function HotelCard({ h, st, nights, isBest, open, setOpen, updTrip }) {
               <Trash2 size={14} /> Remove
             </button>
           </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ---------------- Transfers ---------------- */
+
+const transfersOf = (trip) => (Array.isArray(trip.transfers) ? trip.transfers : []);
+const transferTitle = (x) => `${x.from || "?"} → ${x.to || "?"}`;
+
+function TransfersTab({ trip, state, updTrip }) {
+  const st = state.settings;
+  const [open, setOpen] = useState(null);
+  const list = useMemo(
+    () => transfersOf(trip).slice().sort((a, b) => (a.date || "9999").localeCompare(b.date || "9999") || (a.time || "99:99").localeCompare(b.time || "99:99")),
+    [trip],
+  );
+  const tasks = list.flatMap((x) => x.tasks);
+  const done = tasks.filter((t) => t.done).length;
+  const totalUSD = list.reduce((s, x) => s + (toUSD(x.cost, x.currency, st) ?? 0), 0);
+  const withCost = list.some((x) => toUSD(x.cost, x.currency, st) !== null);
+
+  const add = (patch = {}) => {
+    const x = normTransfer(patch);
+    updTrip((t) => { t.transfers = transfersOf(t); t.transfers.push(x); });
+    return x;
+  };
+  const addOne = () => setOpen(add({ date: trip.start }).id);
+  // One arrival and one departure per destination, dated to the stay.
+  const addPairs = () => {
+    let first = null;
+    trip.destinations.forEach((d) => {
+      const a = add({ destId: d.id, from: `${d.name} airport`, to: "Hotel", date: d.start });
+      add({ destId: d.id, from: "Hotel", to: `${d.name} airport`, date: d.end });
+      first = first || a;
+    });
+    if (first) setOpen(first.id);
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h2 className="display text-2xl font-bold">Transfers</h2>
+          <p className="muted">
+            {list.length
+              ? `${list.length} transfer${list.length === 1 ? "" : "s"}, ${done} of ${tasks.length} steps done${withCost ? `, ${money(totalUSD, st)} budgeted` : ""}`
+              : "Airport to hotel, hotel to airport, and anything in between. Each one carries a checklist so nothing is left for the night before."}
+          </p>
+        </div>
+        <div className="flex gap-2">
+          {!!list.length && (
+            <button className="btn btn-quiet" onClick={() => updTrip((t) => { transfersOf(t).forEach((x) => x.tasks.forEach((k) => { k.done = false; })); })}>
+              <RefreshCw size={14} /> Uncheck all
+            </button>
+          )}
+          <button className="btn" onClick={addPairs}><Plus size={14} /> Airport ↔ hotel for each stop</button>
+          <button className="btn btn-solid" onClick={addOne}><Plus size={14} /> Log transfer</button>
+        </div>
+      </div>
+
+      {tasks.length > 0 && done === tasks.length && (
+        <div className="verdict text-sm flex items-center gap-2"><CheckCircle2 size={16} aria-hidden="true" /> Every transfer step is ticked. Ground side of this trip is ready.</div>
+      )}
+
+      {!list.length ? (
+        <Empty>No transfers yet. Start with the airport runs for each stop, then add anything between towns.</Empty>
+      ) : (
+        <div className="space-y-2">
+          {list.map((x) => (
+            <TransferCard key={x.id} x={x} trip={trip} st={st} open={open === x.id} setOpen={(o) => setOpen(o ? x.id : null)} updTrip={updTrip} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TransferCard({ x, trip, st, open, setOpen, updTrip }) {
+  const [draft, setDraft] = useState("");
+  const edit = (fn) => updTrip((t) => { const y = transfersOf(t).find((z) => z.id === x.id); if (y) fn(y); });
+  const set = (k, v) => edit((y) => { y[k] = v; });
+  const setMode = (mode) => edit((y) => {
+    // Swap in the new mode's checklist unless you've already started ticking or editing this one.
+    const untouched = !y.tasks.some((k) => k.done) && y.tasks.every((k) => (TRANSFER_MODES[y.mode]?.[1] || []).includes(k.text));
+    y.mode = mode;
+    if (untouched) y.tasks = transferTasks(mode);
+  });
+  const addTask = () => {
+    const text = draft.trim();
+    if (!text) return;
+    edit((y) => { y.tasks.push({ id: uid(), text, done: false }); });
+    setDraft("");
+  };
+  const dest = trip.destinations.find((d) => d.id === x.destId);
+  const total = x.tasks.length;
+  const done = x.tasks.filter((k) => k.done).length;
+  const cost = toUSD(x.cost, x.currency, st);
+  const status = total === 0 ? "info" : done === total ? "ok" : done === 0 ? "bad" : "warn";
+  const statusText = total === 0 ? "No steps" : done === total ? "Ready" : `${done} of ${total} done`;
+
+  return (
+    <div className={`panel ${status === "ok" ? "picked" : ""}`}>
+      <div className="flex flex-wrap items-center gap-3 p-3">
+        <button className="btn btn-quiet" aria-expanded={open} aria-label="Edit details" onClick={() => setOpen(!open)}>
+          {open ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+        </button>
+        <div className="min-w-0 flex-1">
+          <div className="font-semibold">{transferTitle(x)}</div>
+          <div className="flex flex-wrap gap-1 mt-1">
+            <span className="chip">{TRANSFER_MODES[x.mode][0]}</span>
+            <span className="chip chip-info num">{x.date ? `${fmtDow(x.date)} ${fmtDate(x.date)}` : "No date"}{x.time ? ` ${x.time}` : ""}</span>
+            {dest && <span className="chip chip-info">{dest.name}</span>}
+            <Chip s={status}>{statusText}</Chip>
+          </div>
+          {!open && x.notes && <p className="text-sm muted mt-1">{x.notes}</p>}
+        </div>
+        <div className="text-right num">
+          <div className="font-bold">{cost === null ? <span className="muted font-normal">No cost yet</span> : money(cost, st)}</div>
+          {cost !== null && <div className="text-xs muted">{money(cost, st, st.secondaryCurrency)}</div>}
+        </div>
+      </div>
+
+      {open && (
+        <div className="p-3 pt-0 grid gap-3 lg:grid-cols-5">
+          <div className="grid gap-3 sm:grid-cols-2 lg:col-span-3 content-start">
+            <F label="From"><input value={x.from} onChange={(e) => set("from", e.target.value)} placeholder="PEK airport" /></F>
+            <F label="To"><input value={x.to} onChange={(e) => set("to", e.target.value)} placeholder="Hotel" /></F>
+            <F label="How">
+              <select value={x.mode} onChange={(e) => setMode(e.target.value)}>
+                {Object.entries(TRANSFER_MODES).map(([k, [label]]) => <option key={k} value={k}>{label}</option>)}
+              </select>
+            </F>
+            <F label="Destination">
+              <select value={x.destId} onChange={(e) => set("destId", e.target.value)}>
+                <option value="">Any</option>
+                {trip.destinations.map((d) => <option key={d.id} value={d.id}>{d.name}</option>)}
+              </select>
+            </F>
+            <F label="Date"><input type="date" value={x.date} onChange={(e) => set("date", e.target.value)} /></F>
+            <F label="Time"><input type="time" value={x.time} onChange={(e) => set("time", e.target.value)} /></F>
+            <F label="Cost"><Num value={x.cost} min={0} onChange={(v) => set("cost", v)} /></F>
+            <F label="Currency"><CurSelect value={x.currency} onChange={(v) => set("currency", v)} /></F>
+            <F label="Link" className="sm:col-span-2"><input value={x.link} onChange={(e) => set("link", e.target.value)} placeholder="https:// booking, map or timetable" /></F>
+            <F label="Notes" className="sm:col-span-2"><textarea rows={2} value={x.notes} onChange={(e) => set("notes", e.target.value)} placeholder="Meeting point, driver name, plate, what to do if it falls through" /></F>
+            <div className="flex items-end gap-2 sm:col-span-2">
+              {/^https?:\/\//.test(x.link) && <a className="btn btn-quiet" href={x.link} target="_blank" rel="noreferrer"><ExternalLink size={14} /> Open</a>}
+              <button className="btn btn-quiet" style={{ color: "var(--bad)" }} onClick={() => updTrip((t) => { t.transfers = transfersOf(t).filter((y) => y.id !== x.id); })}>
+                <Trash2 size={14} /> Remove
+              </button>
+            </div>
+          </div>
+
+          <section className="panel p-3 lg:col-span-2" style={{ background: "var(--page)" }}>
+            <div className="flex items-center justify-between gap-2">
+              <h3 className="display text-lg font-bold">Before the trip</h3>
+              <span className="text-xs muted num">{done} of {total}</span>
+            </div>
+            {!total && <p className="text-sm muted mt-1">No steps for this one. Add what you need to do below.</p>}
+            <ul className="mt-2">
+              {x.tasks.map((k) => (
+                <li key={k.id} className="flex items-center gap-2 py-0.5">
+                  <input type="checkbox" id={`tr_${k.id}`} checked={k.done} onChange={(e) => edit((y) => { const z = y.tasks.find((q) => q.id === k.id); if (z) z.done = e.target.checked; })} />
+                  <label htmlFor={`tr_${k.id}`} className="flex-1" style={{ textDecoration: k.done ? "line-through" : "none", color: k.done ? "var(--muted)" : undefined }}>
+                    {k.text}
+                  </label>
+                  <button className="btn btn-quiet" aria-label={`Remove ${k.text}`} onClick={() => edit((y) => { y.tasks = y.tasks.filter((q) => q.id !== k.id); })}>
+                    <Trash2 size={12} />
+                  </button>
+                </li>
+              ))}
+            </ul>
+            <div className="flex gap-2 mt-2">
+              <input value={draft} onChange={(e) => setDraft(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addTask(); } }} placeholder="Add a step" aria-label="New step" />
+              <button className="btn" onClick={addTask} disabled={!draft.trim()}><Plus size={14} /> Add</button>
+            </div>
+            <button className="btn btn-quiet mt-2 text-xs" onClick={() => edit((y) => { y.tasks = transferTasks(y.mode); })}>
+              <RefreshCw size={12} /> Reset to the {TRANSFER_MODES[x.mode][0].toLowerCase()} checklist
+            </button>
+          </section>
         </div>
       )}
     </div>
