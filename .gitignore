@@ -1,0 +1,8 @@
+node_modules
+dist
+*.local
+.DS_Store
+# personal data never goes in this public repo
+travel-hq*.json
+!package.json
+!package-lock.json
