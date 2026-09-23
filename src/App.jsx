@@ -283,7 +283,7 @@ const normHotel = (o = {}) => {
   const h = {
     id: uid(), destId: "", name: "", area: "", nights: null, total: null, currency: "USD",
     channel: "latam", badgeAvios: false, badgeLatam: false, rating: "", notes: "", link: "",
-    selected: false, booked: false, confirmation: "", source: "manual", ...o,
+    checkIn: "", checkOut: "", selected: false, booked: false, confirmation: "", source: "manual", ...o,
   };
   h.id = o.id || uid();
   h.total = numOrNull(h.total);
@@ -331,9 +331,31 @@ function migrate(s) {
     balances: s.balances || [],
     rules: s.rules || [],
     travelers: s.travelers || [],
-    trips: s.trips || [],
+    trips: (s.trips || []).map(migrateTrip),
     packPresets: s.packPresets || [],
   };
+}
+
+const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+function migrateTrip(t) {
+  if (!t || !Array.isArray(t.hotels)) return t;
+  const year = validD(t.start) ? Number(t.start.slice(0, 4)) : new Date().getFullYear();
+  const toISO = (day, mon) => {
+    const m = MONTHS.indexOf(mon.slice(0, 3).toLowerCase());
+    if (m < 0) return "";
+    let iso = `${year}-${String(m + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+    if (validD(t.start) && parseD(iso) < parseD(t.start) - 60 * DAY) iso = `${year + 1}${iso.slice(4)}`;
+    return validD(iso) ? iso : "";
+  };
+  const hotels = t.hotels.map((h) => {
+    if (!h || validD(h.checkIn) || typeof h.notes !== "string") return h;
+    const m = h.notes.match(/^(\d{1,2}) ([A-Za-z]{3,9}) to (\d{1,2}) ([A-Za-z]{3,9})(?:\.\s*|$)/);
+    if (!m) return h;
+    const checkIn = toISO(m[1], m[2]), checkOut = toISO(m[3], m[4]);
+    if (!checkIn || !checkOut || parseD(checkOut) <= parseD(checkIn)) return h;
+    return { ...h, checkIn, checkOut, notes: h.notes.slice(m[0].length) };
+  });
+  return { ...t, hotels };
 }
 
 const isBlank = (s) => !s || (!s.trips?.length && !s.balances?.length && !s.travelers?.length && !s.rules?.length);
@@ -383,15 +405,78 @@ const normTransfer = (o = {}) => ({
 /* Calculations                                                        */
 /* ------------------------------------------------------------------ */
 
+// A hotel's own dates when known, otherwise the destination's.
+function hotelRange(h, d) {
+  const s = validD(h.checkIn) ? h.checkIn : d?.start;
+  let e = validD(h.checkOut) ? h.checkOut : null;
+  if (!e) e = validD(h.checkIn) && numOrNull(h.nights) ? addDays(h.checkIn, h.nights) : d?.end;
+  return [s, e];
+}
+function hotelNights(h, d) {
+  if (numOrNull(h.nights) !== null) return h.nights;
+  const [s, e] = hotelRange(h, d);
+  return nightsBetween(s, e);
+}
+const rangesOverlap = ([a1, a2], [b1, b2]) =>
+  !(validD(a1) && validD(a2) && validD(b1) && validD(b2)) || (parseD(a1) < parseD(b2) && parseD(b1) < parseD(a2));
+const routeEnds = (r) => { const a = (r || "").split("-").map((x) => x.trim().toUpperCase()).filter(Boolean); return [a[0] || "", a[a.length - 1] || ""]; };
+
+// Picking marks what you're going with. It only unpicks real alternatives
+// (same stay dates, or same leg from/to the same airport) and never anything
+// already booked, so split stays and separate tickets can all be picked.
+function pickHotel(t, id, on) {
+  const x = t.hotels.find((h) => h.id === id);
+  if (!x) return;
+  x.selected = on;
+  if (!on) return;
+  const d = t.destinations.find((dd) => dd.id === x.destId);
+  const r = hotelRange(x, d);
+  t.hotels.forEach((y) => {
+    if (y.id !== x.id && y.destId === x.destId && y.selected && !y.booked && rangesOverlap(r, hotelRange(y, d))) y.selected = false;
+  });
+}
+function pickFlight(t, id, on) {
+  const x = t.flights.find((f) => f.id === id);
+  if (!x) return;
+  x.selected = on;
+  if (!on) return;
+  const [xa, xz] = routeEnds(x.route);
+  t.flights.forEach((y) => {
+    if (y.id === x.id || y.leg !== x.leg || !y.selected || y.booked) return;
+    const [ya, yz] = routeEnds(y.route);
+    if (!xa || !ya || xa === ya || xz === yz) y.selected = false;
+  });
+}
+
+// Nights of a destination not covered by any picked hotel.
+function uncoveredNights(d, picked) {
+  if (!validD(d.start) || !validD(d.end)) return [];
+  const out = [];
+  for (let day = d.start; parseD(day) < parseD(d.end); day = addDays(day, 1)) {
+    const covered = picked.some((h) => { const [s, e] = hotelRange(h, d); return validD(s) && validD(e) && parseD(s) <= parseD(day) && parseD(day) < parseD(e); });
+    if (!covered) out.push(day);
+  }
+  return out;
+}
+
 function tripCosts(trip, st) {
   const flights = trip.flights.filter((f) => f.selected);
   const flightUSD = flights.reduce((a, f) => a + (toUSD(f.pricePP, f.currency, st) || 0) * Math.max(1, f.travelerIds?.length || 0), 0);
   const dests = trip.destinations.map((d) => {
     const nights = nightsBetween(d.start, d.end);
-    const hotel = trip.hotels.find((h) => h.destId === d.id && h.selected);
-    const hn = hotel ? hotel.nights ?? nights : nights;
-    const total = hotel ? toUSD(hotel.total, hotel.currency, st) : null;
-    return { d, nights, hotel, total, perNight: total !== null && hn ? total / hn : null };
+    const hotels = trip.hotels
+      .filter((h) => h.destId === d.id && h.selected)
+      .sort((a, b) => (hotelRange(a, d)[0] || "").localeCompare(hotelRange(b, d)[0] || ""));
+    const priced = hotels.filter((h) => toUSD(h.total, h.currency, st) !== null);
+    const total = priced.length ? priced.reduce((a, h) => a + toUSD(h.total, h.currency, st), 0) : null;
+    const pricedNights = priced.reduce((a, h) => a + hotelNights(h, d), 0);
+    const covered = hotels.reduce((a, h) => a + hotelNights(h, d), 0);
+    const gaps = hotels.length ? uncoveredNights(d, hotels) : [];
+    return {
+      d, nights, hotels, total, covered, gaps, unpriced: hotels.length - priced.length,
+      names: hotels.map((h) => h.name || "Unnamed hotel").join(" → "),
+      perNight: total !== null && pricedNights ? total / pricedNights : null,
+    };
   });
   const hotelUSD = dests.reduce((a, x) => a + (x.total || 0), 0);
   const nights = nightsBetween(trip.start, trip.end);
@@ -808,10 +893,10 @@ function TripView({ trip, state, update, updTrip }) {
         </div>
 
         <div className="flex gap-2 mt-4 overflow-x-auto pb-1" aria-label="Destinations by nights">
-          {costs.dests.map(({ d, nights, hotel, total, perNight }) => (
+          {costs.dests.map(({ d, nights, hotels, names, total, perNight, gaps }) => (
             <div
               key={d.id}
-              className={`seg ${hotel ? "" : "empty"}`}
+              className={`seg ${hotels.length ? "" : "empty"}`}
               style={{ flexGrow: Math.max(1, nights), flexBasis: 0 }}
             >
               <div className="font-semibold">{d.name}</div>
@@ -819,8 +904,11 @@ function TripView({ trip, state, update, updTrip }) {
                 {fmtDate(d.start)} to {fmtDate(d.end)}, {nights}n
               </div>
               <div className="text-sm mt-1 num">
-                {hotel ? `${hotel.name}: ${money(total, st)}${perNight !== null ? `, ${money(perNight, st)}/night` : ""}` : "No hotel picked"}
+                {hotels.length ? `${names}: ${money(total, st)}${perNight !== null ? `, ${money(perNight, st)}/night` : ""}` : "No hotel picked"}
               </div>
+              {hotels.length > 0 && gaps.length > 0 && (
+                <div className="text-xs mt-1" style={{ opacity: 0.9 }}>{gaps.length} night{gaps.length === 1 ? "" : "s"} without a hotel</div>
+              )}
             </div>
           ))}
           <div className="seg" style={{ background: "var(--gold)", color: "var(--ink)", flexGrow: 0 }}>
@@ -881,10 +969,17 @@ function Overview({ trip, state, update, updTrip, costs }) {
             <tr><th>Item</th><th>Nights</th><th className="text-right">Per night</th><th className="text-right">Total</th><th className="text-right">{st.secondaryCurrency}</th></tr>
           </thead>
           <tbody className="num">
-            {costs.dests.map(({ d, nights, hotel, total, perNight }) => (
+            {costs.dests.map(({ d, nights, hotels, names, covered, gaps, unpriced, total, perNight }) => (
               <tr key={d.id}>
-                <td><div className="font-semibold">{d.name}</div><div className="text-xs muted">{hotel ? hotel.name : "No hotel picked yet"}</div></td>
-                <td>{hotel?.nights ?? nights}</td>
+                <td>
+                  <div className="font-semibold">{d.name}</div>
+                  <div className="text-xs muted">{hotels.length ? names : "No hotel picked yet"}</div>
+                  {hotels.length > 0 && gaps.length > 0 && (
+                    <div className="text-xs" style={{ color: "#7A5608" }}>No hotel for {gaps.map(fmtDate).join(", ")}</div>
+                  )}
+                  {unpriced > 0 && <div className="text-xs muted">{unpriced} picked without a price</div>}
+                </td>
+                <td>{hotels.length ? covered : nights}</td>
                 <td className="text-right">{money(perNight, st)}</td>
                 <td className="text-right">{money(total, st)}</td>
                 <td className="text-right muted">{money(total, st, st.secondaryCurrency)}</td>
@@ -904,7 +999,7 @@ function Overview({ trip, state, update, updTrip, costs }) {
               );
             })}
             {!costs.flights.length && (
-              <tr><td colSpan={5} className="muted">No flights picked yet. Mark one per leg in Flights.</td></tr>
+              <tr><td colSpan={5} className="muted">No flights picked yet. Pick the ones you're taking in Flights.</td></tr>
             )}
             <tr>
               <td className="font-semibold">Hotels subtotal</td><td /><td />
@@ -1143,12 +1238,7 @@ function FlightCard({ f, st, people, isPick, open, setOpen, updTrip }) {
   const earnValue = prog && numOrNull(f.estEarn) ? (f.estEarn * (st.valuation[prog] || 0)) / 100 : null;
   const checks = flightChecks(f, st);
 
-  const toggleSelect = () => updTrip((t) => {
-    t.flights.forEach((x) => {
-      if (x.id === f.id) x.selected = !x.selected;
-      else if (x.leg === f.leg) x.selected = false;
-    });
-  });
+  const toggleSelect = () => updTrip((t) => pickFlight(t, f.id, !f.selected));
 
   return (
     <div className={`panel ${f.selected ? "picked" : ""}`}>
@@ -1258,7 +1348,11 @@ function HotelDest({ d, trip, state, updTrip }) {
   const st = state.settings;
   const [open, setOpen] = useState(null);
   const nights = nightsBetween(d.start, d.end);
-  const list = trip.hotels.filter((h) => h.destId === d.id);
+  const list = trip.hotels
+    .filter((h) => h.destId === d.id)
+    .sort((a, b) => (hotelRange(a, d)[0] || "").localeCompare(hotelRange(b, d)[0] || "") || (a.name || "").localeCompare(b.name || ""));
+  const picked = list.filter((h) => h.selected);
+  const gaps = picked.length ? uncoveredNights(d, picked) : [];
   const add = () => {
     const h = normHotel({ destId: d.id });
     updTrip((t) => { t.hotels.push(h); });
@@ -1271,8 +1365,10 @@ function HotelDest({ d, trip, state, updTrip }) {
     if (tot === null) return null;
     return tot - milesFor(h, tot, st).value;
   };
-  const priced = list.filter((h) => eff(h) !== null);
-  const best = priced.length ? priced.reduce((a, b) => (eff(b) < eff(a) ? b : a)) : null;
+  // Compare per night, and only among options you haven't booked yet.
+  const perNightEff = (h) => eff(h) / (hotelNights(h, d) || 1);
+  const priced = list.filter((h) => !h.booked && eff(h) !== null);
+  const best = priced.length > 1 ? priced.reduce((a, b) => (perNightEff(b) < perNightEff(a) ? b : a)) : null;
 
   return (
     <section>
@@ -1287,14 +1383,20 @@ function HotelDest({ d, trip, state, updTrip }) {
         <Empty>No hotels logged for {d.name} yet. Add the ones you're considering to compare price per night and miles.</Empty>
       ) : (
         <div className="space-y-2">
+          {picked.length > 0 && (
+            <p className="text-sm" style={{ color: gaps.length ? "#7A5608" : "var(--ok)" }}>
+              {gaps.length
+                ? `Picked stays leave ${gaps.length} night${gaps.length === 1 ? "" : "s"} uncovered: ${gaps.map(fmtDate).join(", ")}.`
+                : `Picked stays cover all ${nights} night${nights === 1 ? "" : "s"}.`}
+            </p>
+          )}
           {best && (
             <div className="verdict text-sm">
-              Best value after miles: <strong>{best.name}</strong> at {money(eff(best), st)} effective
-              ({money(eff(best) / ((best.nights ?? nights) || 1), st)}/night).
+              Best value after miles among options not booked yet: <strong>{best.name}</strong> at {money(perNightEff(best), st)}/night effective.
             </div>
           )}
           {list.map((h) => (
-            <HotelCard key={h.id} h={h} st={st} nights={nights} isBest={best?.id === h.id} open={open === h.id} setOpen={(o) => setOpen(o ? h.id : null)} updTrip={updTrip} />
+            <HotelCard key={h.id} h={h} d={d} st={st} nights={nights} isBest={best?.id === h.id} open={open === h.id} setOpen={(o) => setOpen(o ? h.id : null)} updTrip={updTrip} />
           ))}
         </div>
       )}
@@ -1320,22 +1422,18 @@ function milesFor(h, totalUSD, st) {
   return { latam, avios, value, label };
 }
 
-function HotelCard({ h, st, nights, isBest, open, setOpen, updTrip }) {
+function HotelCard({ h, d, st, nights, isBest, open, setOpen, updTrip }) {
   const set = (k, v) => updTrip((t) => { const x = t.hotels.find((y) => y.id === h.id); if (x) x[k] = v; });
-  const n = h.nights ?? nights;
+  const n = hotelNights(h, d);
+  const ownDates = validD(h.checkIn) && validD(h.checkOut);
   const tot = toUSD(h.total, h.currency, st);
   const m = milesFor(h, tot, st);
   const lv = (m.latam * st.valuation.latam) / 100;
   const av = (m.avios * st.valuation.avios) / 100;
-  const betterChannel = tot !== null && h.badgeAvios && av > lv && h.channel === "latam" ? "Qatar site earns more here" :
+  const betterChannel = h.booked ? null : tot !== null && h.badgeAvios && av > lv && h.channel === "latam" ? "Qatar site earns more here" :
     tot !== null && lv > av && h.channel === "qatar" ? "LATAM site earns more here" : null;
 
-  const toggleSelect = () => updTrip((t) => {
-    t.hotels.forEach((x) => {
-      if (x.id === h.id) x.selected = !x.selected;
-      else if (x.destId === h.destId) x.selected = false;
-    });
-  });
+  const toggleSelect = () => updTrip((t) => pickHotel(t, h.id, !h.selected));
 
   return (
     <div className={`panel ${h.selected ? "picked" : ""}`}>
@@ -1352,6 +1450,7 @@ function HotelCard({ h, st, nights, isBest, open, setOpen, updTrip }) {
             {h.source === "email" && <span className="chip chip-info ml-2">From email</span>}
           </div>
           <div className="flex flex-wrap gap-1 mt-1">
+            {ownDates && <span className="chip num">{fmtDate(h.checkIn)} → {fmtDate(h.checkOut)}</span>}
             <BookedChip x={h} />
             <span className="chip">{CHANNELS[h.channel]}</span>
             {h.badgeLatam && <span className="chip">LATAM badge</span>}
@@ -1376,7 +1475,9 @@ function HotelCard({ h, st, nights, isBest, open, setOpen, updTrip }) {
           <F label="Area"><input value={h.area} onChange={(e) => set("area", e.target.value)} /></F>
           <F label="Total for stay"><Num value={h.total} onChange={(v) => set("total", v)} /></F>
           <F label="Currency"><CurSelect value={h.currency} onChange={(v) => set("currency", v)} /></F>
-          <F label={`Nights (blank = ${nights})`}><Num value={h.nights} min={0} onChange={(v) => set("nights", v)} /></F>
+          <F label="Check-in"><input type="date" value={h.checkIn || ""} onChange={(e) => set("checkIn", e.target.value)} /></F>
+          <F label="Check-out"><input type="date" value={h.checkOut || ""} onChange={(e) => set("checkOut", e.target.value)} /></F>
+          <F label={`Nights (blank = ${ownDates ? "from dates" : nights})`}><Num value={h.nights} min={0} onChange={(v) => set("nights", v)} /></F>
           <F label="Book through" className="sm:col-span-2">
             <select value={h.channel} onChange={(e) => set("channel", e.target.value)}>
               {Object.entries(CHANNELS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
@@ -1759,13 +1860,13 @@ function buildProposals(res, trip, state) {
       const channel = /latam/i.test(tag) ? "latam" : /qatar|avios|privilege/i.test(tag) ? "qatar"
         : b.provider && similarName(b.provider, b.name) ? "direct" : /booking\.com/i.test(tag) ? "" : "other";
       const notes = [
-        checkIn && checkOut && d && (checkIn !== d.start || checkOut !== d.end) && `${fmtDate(checkIn)} to ${fmtDate(checkOut)}`,
         b.roomType, b.guests && `${b.guests} guests`, b.checkInTime && `Check-in from ${b.checkInTime}`,
         b.cancellation, b.paid === true ? "Paid" : b.paid === false ? "Pay at the property" : "",
         pr.note, via, status === "pending" && "Not confirmed yet",
       ].filter(Boolean).join(". ");
       const obj = normHotel({
-        destId: d?.id || "", name: b.name || "", area: b.area || b.city || "", nights: n !== null && n !== dn ? n : null,
+        destId: d?.id || "", name: b.name || "", area: b.area || b.city || "", checkIn, checkOut,
+        nights: n !== null && n !== (checkIn && checkOut ? nightsBetween(checkIn, checkOut) : dn) ? n : null,
         total: pr.value, currency: pr.currency, channel: channel || "latam", notes, link: b.link || "",
         selected: status !== "cancelled", booked, confirmation: (b.confirmation || "").toString().trim(), source: "email",
       });
@@ -1836,13 +1937,13 @@ function applyProposal(t, p) {
       merge(x, ["route", "date", "operating", "marketing", "flightNo", "durationH", "fareClass", "pricePP", "currency", "travelerIds", "link", "confirmation"]);
       x.stops = o.stops; x.cabin = o.cabin; x.basic = o.basic;
       x.notes = addNote(x.notes, o.notes);
-      x.booked = o.booked; x.selected = true;
+      x.booked = o.booked;
       if (x.source === "ai") x.source = "email";
     } else {
       x = clone(o);
       t.flights.push(x);
     }
-    t.flights.forEach((f) => { if (f.id !== x.id && f.leg === x.leg) f.selected = false; });
+    pickFlight(t, x.id, true);
     return;
   }
 
@@ -1850,17 +1951,18 @@ function applyProposal(t, p) {
     let x = p.target !== "new" && t.hotels.find((h) => h.id === p.target);
     if (p.status === "cancelled") { if (x) cancel(x); return; }
     if (x) {
-      merge(x, ["name", "total", "currency", "nights", "link", "confirmation"]);
+      merge(x, ["name", "total", "currency", "checkIn", "checkOut", "link", "confirmation"]);
+      x.nights = o.nights;
       if (!x.area && o.area) x.area = o.area;
       if (!x.destId && o.destId) x.destId = o.destId;
       if (p.channelFromEmail) x.channel = p.channelFromEmail;
       x.notes = addNote(x.notes === "Candidate. Add the Booking.com price." ? "" : x.notes, o.notes);
-      x.booked = o.booked; x.selected = true;
+      x.booked = o.booked;
     } else {
       x = clone(o);
       t.hotels.push(x);
     }
-    t.hotels.forEach((h) => { if (h.id !== x.id && h.destId === x.destId) h.selected = false; });
+    pickHotel(t, x.id, true);
     return;
   }
 
@@ -2015,7 +2117,7 @@ function ImportPanel({ trip, state, updTrip, onClose, onDone }) {
           </ul>
           {review.ignored && <p className="text-sm muted mt-2">Not imported: {review.ignored}</p>}
           {review.warnings.map((w) => <p key={w} className="text-sm muted mt-1">{w}</p>)}
-          <p className="text-xs muted mt-2">Updated and new items are marked Booked and Picked; other options for the same leg or stay are unpicked.</p>
+          <p className="text-xs muted mt-2">Saved items are marked Booked and Picked. Unbooked alternatives for the same dates or leg are unpicked; other bookings stay as they are.</p>
           <div className="flex flex-wrap gap-2 mt-3">
             <button className="btn btn-solid" disabled={!chosen.length} onClick={apply}><Check size={14} /> Save {chosen.length} to {trip.name}</button>
             <button className="btn btn-quiet" onClick={() => setReview(null)}>Back</button>

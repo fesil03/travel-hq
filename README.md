@@ -1,6 +1,6 @@
 # Travel HQ
 
-Personal trip planner: one tab per trip with flight and hotel logs checked against your booking rules, costs per night and per destination, ground transfers with a pre-trip checklist per leg, itinerary, weather and packing presets.
+Personal trip planner: one tab per trip with flight and hotel logs checked against your booking rules, costs per night and per destination (split stays across several hotels supported), ground transfers with a pre-trip checklist per leg, itinerary, weather and packing presets.
 
 - **App (public repo `travel-hq`)**: static site on GitHub Pages at https://fesil03.github.io/travel-hq/. Contains no personal data.
 - **Data (private repo `travel-hq-data`)**: one file, `travel-hq.json`. Every sync is a commit, so the repo history is your version history.
