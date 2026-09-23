@@ -2799,7 +2799,9 @@ function DevicePanel({ device, onSave, sync, onSyncNow }) {
   const prov = AI_PROVIDERS[d.aiProvider] ? d.aiProvider : "anthropic";
   const runTest = async () => {
     setTest("busy");
-    try { await testAI(d); setTest({ ok: true, text: `Working. ${aiConfig(d).label} answered from this browser.` }); }
+    // Save first: imports use the saved settings, so a passing test must mean it's saved.
+    if (changed) onSave(d);
+    try { await testAI(d); setTest({ ok: true, text: `Working and saved. ${aiConfig(d).label} answered from this browser.` }); }
     catch (e) { setTest({ ok: false, text: e.message }); }
   };
   const changed = JSON.stringify(d) !== JSON.stringify(device);
@@ -2870,10 +2872,11 @@ function DevicePanel({ device, onSave, sync, onSyncNow }) {
       </div>
       <p className="text-xs muted mt-2">{AI_PROVIDERS[prov].note} Calls go straight from this browser to the provider; the key never syncs.</p>
       <div className="flex flex-wrap items-center gap-2 mt-3">
-        <button className="btn" disabled={!changed} onClick={() => onSave(d)}>Save</button>
+        <button className={`btn ${changed ? "btn-solid" : ""}`} disabled={!changed} onClick={() => onSave(d)}>{changed ? "Save" : "Saved"}</button>
         <button className="btn btn-quiet" disabled={!d.aiKey || test === "busy"} onClick={runTest}>
-          {test === "busy" ? <Loader2 size={14} className="spin" /> : <RefreshCw size={14} />} Test connection
+          {test === "busy" ? <Loader2 size={14} className="spin" /> : <RefreshCw size={14} />} Save and test
         </button>
+        {changed && test !== "busy" && !test && <span className="text-sm" style={{ color: "var(--bad)" }}>Not saved yet</span>}
         {test && test !== "busy" && (
           <span className="text-sm" role="status" style={{ color: test.ok ? "var(--ok)" : "var(--bad)" }}>{test.text}</span>
         )}
