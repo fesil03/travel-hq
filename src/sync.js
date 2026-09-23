@@ -13,9 +13,9 @@ const META_KEY = "travelhq:syncmeta";
 
 export function getDevice() {
   try {
-    return { owner: "", repo: "", branch: "main", path: "travel-hq.json", token: "", aiKey: "", aiModel: "claude-sonnet-5", ...JSON.parse(localStorage.getItem(DEVICE_KEY) || "{}") };
+    return { owner: "", repo: "", branch: "main", path: "travel-hq.json", token: "", aiProvider: "anthropic", aiKey: "", aiModel: "claude-sonnet-5", aiBase: "", ...JSON.parse(localStorage.getItem(DEVICE_KEY) || "{}") };
   } catch (e) {
-    return { owner: "", repo: "", branch: "main", path: "travel-hq.json", token: "", aiKey: "", aiModel: "claude-sonnet-5" };
+    return { owner: "", repo: "", branch: "main", path: "travel-hq.json", token: "", aiProvider: "anthropic", aiKey: "", aiModel: "claude-sonnet-5", aiBase: "" };
   }
 }
 export function setDevice(d) {

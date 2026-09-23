@@ -41,14 +41,15 @@ Open the same URL, add it to the home screen, enter the same three sync fields â
 - Opening or returning to the app pulls changes from other devices.
 - Offline: edits stay on the device and push when you're back online.
 - If two devices both changed things before syncing, the most recent edit wins for the whole file. Anything overwritten is still in the data repo's commit history.
-- The token and optional Anthropic key live only in that browser's storage. Anyone with access to the unlocked device could read them; revoke the token on GitHub if a device is lost.
+- The token and optional AI key live only in that browser's storage. Anyone with access to the unlocked device could read them; revoke the token on GitHub if a device is lost.
 
 ## Network notes (mainland China)
 - App files, fonts and icons are bundled and cached offline. No CDNs.
 - Weather: Open-Meteo, no key. Up to 16 days out it shows the forecast; further out, the same dates last year. For regions (e.g. Bali), set the weather location to a city (Denpasar).
 - Exchange rates: Frankfurter (ECB rates), no key. Rates can always be typed in.
 - GitHub API can be slow or blocked without a VPN; the app keeps working locally and syncs later.
-- AI features (itinerary drafts, packing suggestions) are optional, need your own Anthropic API key, and need a VPN.
+- AI features (importing bookings from emails, itinerary drafts, packing suggestions) are optional and use your own API key, set per device under Wallet and rules â†’ This device. Providers: Claude (needs a VPN on a mainland network), DeepSeek, Qwen, Kimi, GLM, or any OpenAI-compatible endpoint. Use *Test connection* to confirm a provider accepts calls from the browser.
+- **Import booking** (on each trip): paste a confirmation email or add the `.eml`, PDF voucher or screenshots. Flights, hotels and transfers are extracted, matched to what's already logged, and shown for review; confirmed items are marked Booked with their confirmation number. Email text goes only to the AI provider you picked.
 
 ## Development
 ```bash
@@ -56,4 +57,4 @@ npm install
 npm run dev      # http://localhost:5173/travel-hq/
 npm run build
 ```
-Main code: `src/App.jsx` (UI and rules), `src/sync.js` (local storage and GitHub sync).
+Main code: `src/App.jsx` (UI, rules, booking import), `src/sync.js` (local storage and GitHub sync), `src/ai.js` (AI providers), `src/emailinput.js` (reading .eml, PDF, HTML and images).

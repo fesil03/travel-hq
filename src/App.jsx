@@ -3,7 +3,10 @@ import {
   Plane, BedDouble, CalendarDays, CloudSun, Luggage, LayoutGrid, Wallet, Plus, Trash2,
   Sparkles, Check, ChevronDown, ChevronRight, AlertTriangle, CheckCircle2, Info, Loader2,
   RefreshCw, ArrowLeftRight, XCircle, ExternalLink, Cloud, CloudOff, Download, Upload, CarFront,
+  Mail, X, Paperclip,
 } from "lucide-react";
+import { askAI, aiConfig, aiReady, testAI, AI_PROVIDERS } from "./ai.js";
+import { readInputs } from "./emailinput.js";
 import {
   getDevice, setDevice, syncConfigured, loadLocal, saveLocal, getMeta, setMeta,
   pull, push, ConflictError, NetworkError,
@@ -251,55 +254,10 @@ const tierOf = (code) => {
 };
 const compliant = (f) => (Number(f.stops) || 0) <= 1 && !f.basic;
 
-function extractJSON(text) {
-  if (!text) throw new Error("Empty response");
-  const cleaned = text.replace(/```json/gi, "```");
-  const fence = cleaned.match(/```([\s\S]*?)```/);
-  if (fence) { try { return JSON.parse(fence[1].trim()); } catch (e) { /* fall through */ } }
-  for (let i = 0; i < cleaned.length; i++) {
-    const ch = cleaned[i];
-    if (ch !== "[" && ch !== "{") continue;
-    const close = ch === "[" ? "]" : "}";
-    const end = cleaned.lastIndexOf(close);
-    if (end <= i) continue;
-    try { return JSON.parse(cleaned.slice(i, end + 1)); } catch (e) { /* keep scanning */ }
-  }
-  throw new Error("Couldn't read the AI response as data");
-}
-
-async function askClaude(prompt, { search = false } = {}) {
-  const dev = getDevice();
-  if (!dev.aiKey) throw new Error("AI features need an Anthropic API key. Add one in Wallet and rules, under This device");
-  const body = {
-    model: dev.aiModel || "claude-sonnet-5",
-    max_tokens: 1500,
-    messages: [{ role: "user", content: prompt }],
-  };
-  if (search) body.tools = [{ type: "web_search_20250305", name: "web_search" }];
-  let res;
-  try {
-    res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": dev.aiKey.trim(),
-        "anthropic-version": "2023-06-01",
-        "anthropic-dangerous-direct-browser-access": "true",
-      },
-      body: JSON.stringify(body),
-    });
-  } catch (e) {
-    throw new Error("Can't reach Anthropic. On a mainland China network this needs a VPN");
-  }
-  if (!res.ok) {
-    let msg = "";
-    try { msg = (await res.json()).error?.message || ""; } catch (e) { /* ignore */ }
-    throw new Error(`AI request returned ${res.status}${msg ? `: ${msg}` : ""}`);
-  }
-  const data = await res.json();
-  const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
-  return extractJSON(text);
-}
+// Existing AI features (itinerary drafts, packing suggestions) go through the
+// provider chosen under This device.
+const askClaude = (prompt, { search = false } = {}) =>
+  askAI({ text: prompt, search: search && aiConfig().id === "anthropic" });
 
 const JSON_ONLY = "Respond with ONLY valid JSON. No prose, no markdown, no code fences.";
 
@@ -308,7 +266,7 @@ const normFlight = (o = {}) => {
     id: uid(), leg: "Outbound", route: "", date: "", operating: "", marketing: "", flightNo: "",
     stops: 0, durationH: null, cabin: "Economy", basic: false, fareClass: "", pricePP: null,
     currency: "CNY", travelerIds: [], awardPoints: null, awardProgram: "avios", awardTaxes: null,
-    estEarn: null, notes: "", link: "", selected: false, source: "manual", ...o,
+    estEarn: null, notes: "", link: "", selected: false, booked: false, confirmation: "", source: "manual", ...o,
   };
   f.id = o.id || uid();
   f.stops = Number(f.stops) || 0;
@@ -325,7 +283,7 @@ const normHotel = (o = {}) => {
   const h = {
     id: uid(), destId: "", name: "", area: "", nights: null, total: null, currency: "USD",
     channel: "latam", badgeAvios: false, badgeLatam: false, rating: "", notes: "", link: "",
-    selected: false, source: "manual", ...o,
+    selected: false, booked: false, confirmation: "", source: "manual", ...o,
   };
   h.id = o.id || uid();
   h.total = numOrNull(h.total);
@@ -415,6 +373,9 @@ const normTransfer = (o = {}) => ({
   currency: CURRENCIES.includes(o.currency) ? o.currency : "USD",
   link: o.link || "",
   notes: o.notes || "",
+  booked: !!o.booked,
+  confirmation: o.confirmation || "",
+  source: o.source || "manual",
   tasks: Array.isArray(o.tasks) ? o.tasks.map((t) => ({ id: t.id || uid(), text: t.text || "", done: !!t.done })) : transferTasks(o.mode || "taxi"),
 });
 
@@ -582,6 +543,25 @@ function ConfirmButton({ onConfirm, children, className = "btn btn-danger" }) {
       <Trash2 size={14} aria-hidden="true" />
       {armed ? "Click again to confirm" : children}
     </button>
+  );
+}
+
+function BookedChip({ x }) {
+  if (!x.booked && !x.confirmation) return null;
+  return (
+    <span className="chip chip-ok">
+      <CheckCircle2 size={12} aria-hidden="true" />
+      {x.booked ? "Booked" : "Ref"}{x.confirmation ? ` · ${x.confirmation}` : ""}
+    </span>
+  );
+}
+
+function BookedFields({ x, set }) {
+  return (
+    <>
+      <F label="Confirmation / PNR"><input value={x.confirmation || ""} onChange={(e) => set("confirmation", e.target.value)} autoCapitalize="characters" /></F>
+      <label className="flex items-center gap-2 self-end pb-2"><input type="checkbox" checked={!!x.booked} onChange={(e) => set("booked", e.target.checked)} /> Booked</label>
+    </>
   );
 }
 
@@ -799,6 +779,10 @@ const SUBTABS = [
 
 function TripView({ trip, state, update, updTrip }) {
   const [tab, setTab] = useState("overview");
+  const [importing, setImporting] = useState(false);
+  const [flash, setFlash] = useState("");
+  useEffect(() => { if (!flash) return; const t = setTimeout(() => setFlash(""), 6000); return () => clearTimeout(t); }, [flash]);
+  useEffect(() => { setImporting(false); }, [trip.id]);
   const st = state.settings;
   const costs = useMemo(() => tripCosts(trip, st), [trip, st]);
   const names = state.travelers.filter((t) => trip.travelerIds.includes(t.id)).map((t) => t.name);
@@ -847,13 +831,31 @@ function TripView({ trip, state, update, updTrip }) {
         </div>
       </section>
 
-      <div className="flex gap-1 overflow-x-auto mb-5" role="tablist" aria-label="Trip sections">
-        {SUBTABS.map(([id, label, Icon]) => (
-          <button key={id} role="tab" aria-selected={tab === id} className="subtab" onClick={() => setTab(id)}>
-            <Icon size={15} aria-hidden="true" /> {label}
-          </button>
-        ))}
+      <div className="flex flex-wrap items-center justify-between gap-2 mb-5">
+        <div className="flex gap-1 overflow-x-auto" role="tablist" aria-label="Trip sections">
+          {SUBTABS.map(([id, label, Icon]) => (
+            <button key={id} role="tab" aria-selected={tab === id} className="subtab" onClick={() => setTab(id)}>
+              <Icon size={15} aria-hidden="true" /> {label}
+            </button>
+          ))}
+        </div>
+        {!importing && <button className="btn" onClick={() => setImporting(true)}><Mail size={14} /> Import booking</button>}
       </div>
+
+      {flash && <div className="verdict text-sm mb-4 flex items-center gap-2" role="status"><CheckCircle2 size={16} aria-hidden="true" /> {flash}</div>}
+      {importing && (
+        <ImportPanel
+          trip={trip}
+          state={state}
+          updTrip={updTrip}
+          onClose={() => setImporting(false)}
+          onDone={(msg, kind) => {
+            setImporting(false);
+            setFlash(msg);
+            if (kind) setTab({ flight: "flights", hotel: "hotels", transfer: "transfers" }[kind] || tab);
+          }}
+        />
+      )}
 
       {tab === "overview" && <Overview trip={trip} state={state} update={update} updTrip={updTrip} costs={costs} />}
       {tab === "flights" && <FlightsTab trip={trip} state={state} updTrip={updTrip} />}
@@ -1159,12 +1161,14 @@ function FlightCard({ f, st, people, isPick, open, setOpen, updTrip }) {
             {f.route || "Route"} <span className="muted font-normal">{f.flightNo}</span>
             {isPick && <span className="chip chip-warn ml-2">Rules pick</span>}
             {f.source === "ai" && <span className="chip chip-info ml-2">AI estimate</span>}
+            {f.source === "email" && <span className="chip chip-info ml-2">From email</span>}
           </div>
           <div className="text-sm muted">
             {fmtDate(f.date)}, {carrier(f.operating)?.[0] || f.operating || "carrier?"} ({ALLIANCE_LABEL[allianceOf(f.operating)]}),{" "}
             {f.durationH ? `${f.durationH}h, ` : ""}{f.cabin}
           </div>
           <div className="flex flex-wrap gap-1 mt-1">
+            <BookedChip x={f} />
             {checks.map((c, i) => <Chip key={i} s={c.s}>{c.t}</Chip>)}
           </div>
         </div>
@@ -1222,6 +1226,7 @@ function FlightCard({ f, st, people, isPick, open, setOpen, updTrip }) {
               ))}
             </div>
           </div>
+          <BookedFields x={f} set={set} />
           <F label="Booking link" className="sm:col-span-2"><input value={f.link} onChange={(e) => set("link", e.target.value)} placeholder="https://" /></F>
           <F label="Notes" className="sm:col-span-3 lg:col-span-3"><input value={f.notes} onChange={(e) => set("notes", e.target.value)} /></F>
           <div className="flex items-end gap-2">
@@ -1344,8 +1349,10 @@ function HotelCard({ h, st, nights, isBest, open, setOpen, updTrip }) {
             {h.rating && <span className="muted font-normal"> ({h.rating})</span>}
             {isBest && <span className="chip chip-warn ml-2">Best value</span>}
             {h.source === "ai" && <span className="chip chip-info ml-2">AI estimate</span>}
+            {h.source === "email" && <span className="chip chip-info ml-2">From email</span>}
           </div>
           <div className="flex flex-wrap gap-1 mt-1">
+            <BookedChip x={h} />
             <span className="chip">{CHANNELS[h.channel]}</span>
             {h.badgeLatam && <span className="chip">LATAM badge</span>}
             {h.badgeAvios && <span className="chip">Avios badge</span>}
@@ -1377,6 +1384,7 @@ function HotelCard({ h, st, nights, isBest, open, setOpen, updTrip }) {
           </F>
           <label className="flex items-center gap-2 self-end pb-2"><input type="checkbox" checked={h.badgeLatam} onChange={(e) => set("badgeLatam", e.target.checked)} /> LATAM badge</label>
           <label className="flex items-center gap-2 self-end pb-2"><input type="checkbox" checked={h.badgeAvios} onChange={(e) => set("badgeAvios", e.target.checked)} /> Avios badge</label>
+          <BookedFields x={h} set={set} />
           <F label="Rating"><input value={h.rating} onChange={(e) => set("rating", e.target.value)} /></F>
           <F label="Link"><input value={h.link} onChange={(e) => set("link", e.target.value)} placeholder="https://" /></F>
           <F label="Notes" className="sm:col-span-3 lg:col-span-4"><input value={h.notes} onChange={(e) => set("notes", e.target.value)} /></F>
@@ -1500,6 +1508,7 @@ function TransferCard({ x, trip, st, open, setOpen, updTrip }) {
             <span className="chip">{TRANSFER_MODES[x.mode][0]}</span>
             <span className="chip chip-info num">{x.date ? `${fmtDow(x.date)} ${fmtDate(x.date)}` : "No date"}{x.time ? ` ${x.time}` : ""}</span>
             {dest && <span className="chip chip-info">{dest.name}</span>}
+            <BookedChip x={x} />
             <Chip s={status}>{statusText}</Chip>
           </div>
           {!open && x.notes && <p className="text-sm muted mt-1">{x.notes}</p>}
@@ -1530,6 +1539,7 @@ function TransferCard({ x, trip, st, open, setOpen, updTrip }) {
             <F label="Time"><input type="time" value={x.time} onChange={(e) => set("time", e.target.value)} /></F>
             <F label="Cost"><Num value={x.cost} min={0} onChange={(v) => set("cost", v)} /></F>
             <F label="Currency"><CurSelect value={x.currency} onChange={(v) => set("currency", v)} /></F>
+            <BookedFields x={x} set={set} />
             <F label="Link" className="sm:col-span-2"><input value={x.link} onChange={(e) => set("link", e.target.value)} placeholder="https:// booking, map or timetable" /></F>
             <F label="Notes" className="sm:col-span-2"><textarea rows={2} value={x.notes} onChange={(e) => set("notes", e.target.value)} placeholder="Meeting point, driver name, plate, what to do if it falls through" /></F>
             <div className="flex items-end gap-2 sm:col-span-2">
@@ -1570,6 +1580,449 @@ function TransferCard({ x, trip, st, open, setOpen, updTrip }) {
         </div>
       )}
     </div>
+  );
+}
+
+/* ---------------- Import bookings from email ---------------- */
+
+const IMPORT_SYSTEM = "You read travel booking confirmations, e-tickets and vouchers (any language, including Chinese and Portuguese) and extract the bookings as structured data. You never invent details: anything not stated is null or an empty string.";
+
+function importPrompt(trip, state) {
+  const people = state.travelers.filter((p) => trip.travelerIds.includes(p.id));
+  return `Today is ${todayISO()}. The trip being filled in:
+- ${trip.name}, ${trip.start} to ${trip.end}
+- Destinations: ${trip.destinations.map((d) => `${d.name} (${d.start} to ${d.end})`).join("; ") || "none yet"}
+- Travellers: ${people.map((p) => `${p.name}${p.home ? ` (home airport ${p.home})` : ""}`).join("; ") || "not set"}
+
+List every flight, hotel and ground transfer booked in the material below.
+Rules:
+- Dates YYYY-MM-DD, times 24h HH:MM local time. Infer a missing year from context (bookings are for upcoming travel).
+- Airports as 3-letter IATA codes, airlines as 2-letter IATA codes (e.g. QR, CA, LA).
+- A flight booking has one journey per direction (outbound, return, or each hop of a multi-city). Connecting segments stay in one journey, with the connection airports in "via".
+- Amounts are plain numbers in the currency actually charged or due (ISO 4217 code), taxes and fees included. Give a journey's own price only if the email breaks it out.
+- Transfers cover airport pickups, private drivers, shuttles, pre-booked trains, buses or ferries, and car rentals.
+- status: "confirmed", "pending" (awaiting payment or confirmation) or "cancelled".
+- Use "ignored" for anything else in the email that is a booking but not one of these types (tours, restaurants, insurance).
+${JSON_ONLY}
+Schema:
+{"bookings":[
+ {"type":"flight","status":"confirmed","provider":"who sold it, e.g. Trip.com or Qatar Airways","confirmation":"PNR or booking ref","passengers":["full names"],"totalPrice":0,"currency":"CNY","paid":true,"link":"manage-booking URL or empty",
+  "journeys":[{"from":"PEK","to":"DPS","via":["DOH"],"date":"YYYY-MM-DD","departTime":"HH:MM","arriveTime":"HH:MM","arriveDate":"YYYY-MM-DD","flightNumbers":["QR819","QR960"],"operatingCarrier":"QR","marketingCarrier":"QR","cabin":"Economy","fareClass":"N","basicEconomy":false,"durationHours":null,"price":null}]},
+ {"type":"hotel","status":"confirmed","provider":"Booking.com","confirmation":"","loyalty":"miles or points programme mentioned, e.g. LATAM Pass or Avios","name":"","city":"","area":"","address":"","checkIn":"YYYY-MM-DD","checkOut":"YYYY-MM-DD","checkInTime":"","nights":null,"guests":null,"roomType":"","totalPrice":null,"currency":"","paid":false,"cancellation":"free cancellation deadline or policy","link":""},
+ {"type":"transfer","status":"confirmed","provider":"","confirmation":"","from":"","to":"","date":"YYYY-MM-DD","time":"HH:MM","mode":"booked|shuttle|rental|public|taxi|app|other","meetingPoint":"","contact":"driver or company phone/WeChat","vehicle":"","totalPrice":null,"currency":"","paid":false,"link":""}
+],"ignored":""}`;
+}
+
+const upper = (s) => (s || "").toString().trim().toUpperCase();
+const round2 = (n) => Math.round(n * 100) / 100;
+const normName = (s) =>
+  (s || "").toLowerCase().normalize("NFKD").replace(/[̀-ͯ]/g, "")
+    .replace(/\b(the|hotel|hotels|resort|resorts|spa|and|by|&|villa|villas|suites?|boutique|retreat|bali|ubud|inn)\b/g, " ")
+    .replace(/[^a-z0-9一-鿿]+/g, " ").trim();
+const similarName = (a, b) => {
+  const x = normName(a), y = normName(b);
+  if (!x || !y) return false;
+  if (x.includes(y) || y.includes(x)) return true;
+  const tx = x.split(" ").filter((w) => w.length >= 3);
+  return tx.some((w) => y.split(" ").includes(w));
+};
+const hasText = (v) => v !== null && v !== undefined && v !== "" && !(Array.isArray(v) && !v.length);
+const addNote = (notes, extra) => {
+  const bits = (extra || "").split(". ").filter((b) => b && !(notes || "").includes(b));
+  const base = (notes || "").replace(/[.\s]+$/, "");
+  return [base, bits.join(". ")].filter(Boolean).join(". ");
+};
+const cleanDate = (s) => (validD(s) ? s : "");
+const nearTrip = (trip, a, b = a) => {
+  if (!validD(a)) return true;
+  return parseD(b || a) >= parseD(trip.start) - 3 * DAY && parseD(a) <= parseD(trip.end) + 3 * DAY;
+};
+const shortDate = (s) => (validD(s) ? fmtDate(s) : "no date");
+
+function priceIn(amount, cur) {
+  const n = numOrNull(amount);
+  const c = upper(cur);
+  if (n === null) return { value: null, currency: CURRENCIES.includes(c) ? c : "USD", note: "" };
+  if (CURRENCIES.includes(c)) return { value: n, currency: c, note: "" };
+  return { value: null, currency: "USD", note: `Charged ${n.toLocaleString("en-US")} ${c || "(currency not stated)"}, which the app doesn't convert` };
+}
+
+function destFor(trip, start, end, ...names) {
+  const ds = trip.destinations;
+  if (validD(start)) {
+    const s = parseD(start);
+    const e = validD(end) ? parseD(end) : s + DAY;
+    let best = null, bestOverlap = 0;
+    ds.forEach((d) => {
+      if (!validD(d.start) || !validD(d.end)) return;
+      const o = Math.min(e, parseD(d.end)) - Math.max(s, parseD(d.start));
+      if (o > bestOverlap) { bestOverlap = o; best = d; }
+    });
+    if (best) return best;
+    const on = ds.find((d) => validD(d.start) && validD(d.end) && s >= parseD(d.start) && s <= parseD(d.end));
+    if (on) return on;
+  }
+  const hay = names.filter(Boolean).join(" ").toLowerCase();
+  return ds.find((d) => d.name && hay.includes(d.name.toLowerCase())) || ds[0] || null;
+}
+
+// Turns the model's answer into a reviewable list of changes to this trip.
+function buildProposals(res, trip, state) {
+  const out = [];
+  const people = state.travelers.filter((p) => trip.travelerIds.includes(p.id));
+  const homes = new Set(people.map((p) => upper(p.home)).filter(Boolean));
+  const legLabel = (type, who) =>
+    !who.length || who.length === trip.travelerIds.length ? type : `${type}, ${people.filter((p) => who.includes(p.id)).map((p) => p.name).join(" and ")}`;
+  const matchPeople = (names = []) => {
+    const hay = names.join(" | ").toLowerCase();
+    return people.filter((p) => p.name && hay.includes(p.name.split(" ")[0].toLowerCase())).map((p) => p.id);
+  };
+  const bookings = Array.isArray(res?.bookings) ? res.bookings : Array.isArray(res) ? res : [];
+
+  bookings.forEach((b, bi) => {
+    const status = ["pending", "cancelled"].includes(b.status) ? b.status : "confirmed";
+    const booked = status === "confirmed";
+    const via = b.provider ? `Booked via ${b.provider}` : "";
+
+    if (b.type === "flight") {
+      const J = (Array.isArray(b.journeys) ? b.journeys : []).filter((j) => j && (j.from || j.to || j.date));
+      const matched = matchPeople(b.passengers || []);
+      const who = matched.length ? matched : trip.travelerIds;
+      const pax = matched.length || (b.passengers || []).length || who.length || 1;
+      J.forEach((j, i) => {
+        const from = upper(j.from), to = upper(j.to);
+        const date = cleanDate(j.date);
+        let type;
+        if (J.length > 1) type = i === 0 ? "Outbound" : i === J.length - 1 ? "Return" : "Internal";
+        else if (homes.has(from)) type = "Outbound";
+        else if (homes.has(to)) type = "Return";
+        else if (date && parseD(date) <= parseD(trip.start) + DAY) type = "Outbound";
+        else if (date && parseD(date) >= parseD(trip.end) - DAY) type = "Return";
+        else type = "Internal";
+
+        const split = !hasText(j.price) && hasText(b.totalPrice) && J.length > 1;
+        const pr = priceIn(hasText(j.price) ? j.price : hasText(b.totalPrice) ? b.totalPrice / J.length : null, b.currency);
+        const cab = (j.cabin || "").toLowerCase();
+        const cabin = /first|头等/.test(cab) || /business|商务|公务/.test(cab) ? "Business" : /premium|超级经济/.test(cab) ? "Premium economy" : "Economy";
+        const route = [from, ...(Array.isArray(j.via) ? j.via.map(upper) : []), to].filter(Boolean).join("-");
+        const flightNo = (Array.isArray(j.flightNumbers) ? j.flightNumbers : [j.flightNumbers]).filter(Boolean).map((x) => upper(x).replace(/\s+/g, "")).join(" / ");
+        const notes = [
+          j.departTime && `Departs ${j.departTime}`,
+          j.arriveTime && `arrives ${j.arriveTime}${validD(j.arriveDate) && j.arriveDate !== date ? ` on ${fmtDate(j.arriveDate)}` : ""}`,
+          /first|头等/.test(cab) && "First class",
+          split && "Price is the booking total split evenly across directions",
+          pr.note, via, status === "pending" && "Not confirmed yet",
+        ].filter(Boolean).join(". ");
+        const obj = normFlight({
+          leg: legLabel(type, who), route, date, operating: upper(j.operatingCarrier || j.marketingCarrier), marketing: upper(j.marketingCarrier),
+          flightNo, stops: Array.isArray(j.via) ? j.via.length : 0, durationH: numOrNull(j.durationHours), cabin,
+          basic: !!j.basicEconomy, fareClass: upper(j.fareClass), pricePP: pr.value === null ? null : round2(pr.value / pax),
+          currency: pr.currency, travelerIds: who, notes, link: b.link || "", selected: status !== "cancelled", booked,
+          confirmation: upper(b.confirmation), source: "email",
+        });
+        const ends = (r) => { const a = (r || "").split("-").map((x) => upper(x)); return [a[0], a[a.length - 1]]; };
+        const nums = new Set(flightNo.split(" / ").filter(Boolean));
+        // Strong: same flight numbers, or a placeholder card with no carrier yet.
+        // Weak: same day and leg but a different option you're comparing (offered, not preselected).
+        const scored = trip.flights.map((f) => {
+          const [a, z] = ends(f.route);
+          const sameEnds = a === from && z === to;
+          const sameNo = (f.flightNo || "").toUpperCase().replace(/\s+/g, "").split("/").some((n) => nums.has(n));
+          const placeholder = !f.flightNo && !f.operating;
+          const sameDay = f.date === date || !f.date;
+          const strong = sameDay && (sameNo || (placeholder && (sameEnds || f.leg.startsWith(type))));
+          const weak = sameDay && (sameEnds || f.leg.startsWith(type));
+          return { f, score: strong ? 2 : weak ? 1 : 0 };
+        }).filter((m) => m.score).sort((x, y) => y.score - x.score);
+        const matches = scored.map((m) => m.f);
+        const strongId = scored[0]?.score === 2 ? scored[0].f.id : null;
+        out.push({
+          key: `f${bi}_${i}`, kind: "flight", status, obj, include: status !== "cancelled" || matches.length > 0,
+          target: strongId || (status === "cancelled" && matches[0]?.id) || "new",
+          matches: matches.map((f) => ({ id: f.id, label: `${f.route || "flight"} ${f.flightNo || ""} (${shortDate(f.date)})`.replace(/\s+/g, " ") })),
+          title: `${type}: ${route || "flight"}${flightNo ? `, ${flightNo}` : ""}`,
+          sub: [shortDate(date), j.departTime, obj.cabin, pr.value !== null ? `${money(toUSD(pr.value, pr.currency, state.settings), state.settings)} total` : null, obj.confirmation].filter(Boolean).join(" · "),
+          warnings: [!nearTrip(trip, date) && "Outside this trip's dates", pr.note && "Currency not converted", status === "pending" && "Not confirmed yet", status === "cancelled" && "Cancelled"].filter(Boolean),
+        });
+      });
+      if (!J.length) out.push({ key: `f${bi}`, kind: "note", title: "Flight booking without readable flights", sub: b.confirmation || b.provider || "", include: false, warnings: [] });
+      return;
+    }
+
+    if (b.type === "hotel") {
+      const checkIn = cleanDate(b.checkIn), checkOut = cleanDate(b.checkOut);
+      const d = destFor(trip, checkIn, checkOut, b.city, b.area, b.address, b.name);
+      const dn = d ? nightsBetween(d.start, d.end) : 0;
+      const n = numOrNull(b.nights) ?? (nightsBetween(checkIn, checkOut) || null);
+      const pr = priceIn(b.totalPrice, b.currency);
+      const tag = `${b.provider || ""} ${b.loyalty || ""}`;
+      const channel = /latam/i.test(tag) ? "latam" : /qatar|avios|privilege/i.test(tag) ? "qatar"
+        : b.provider && similarName(b.provider, b.name) ? "direct" : /booking\.com/i.test(tag) ? "" : "other";
+      const notes = [
+        checkIn && checkOut && d && (checkIn !== d.start || checkOut !== d.end) && `${fmtDate(checkIn)} to ${fmtDate(checkOut)}`,
+        b.roomType, b.guests && `${b.guests} guests`, b.checkInTime && `Check-in from ${b.checkInTime}`,
+        b.cancellation, b.paid === true ? "Paid" : b.paid === false ? "Pay at the property" : "",
+        pr.note, via, status === "pending" && "Not confirmed yet",
+      ].filter(Boolean).join(". ");
+      const obj = normHotel({
+        destId: d?.id || "", name: b.name || "", area: b.area || b.city || "", nights: n !== null && n !== dn ? n : null,
+        total: pr.value, currency: pr.currency, channel: channel || "latam", notes, link: b.link || "",
+        selected: status !== "cancelled", booked, confirmation: (b.confirmation || "").toString().trim(), source: "email",
+      });
+      const matches = trip.hotels.filter((h) => similarName(h.name, b.name) && (!d || h.destId === d.id || !h.destId));
+      out.push({
+        key: `h${bi}`, kind: "hotel", status, obj, channelFromEmail: channel, include: status !== "cancelled" || matches.length > 0,
+        target: matches[0]?.id || "new",
+        matches: matches.map((h) => ({ id: h.id, label: h.name || "Unnamed hotel" })),
+        title: `${b.name || "Hotel"}${d ? `, ${d.name}` : ""}`,
+        sub: [checkIn && checkOut ? `${fmtDate(checkIn)} to ${fmtDate(checkOut)}` : null, n && `${n} nights`, pr.value !== null ? money(toUSD(pr.value, pr.currency, state.settings), state.settings) : null, obj.confirmation].filter(Boolean).join(" · "),
+        warnings: [!nearTrip(trip, checkIn, checkOut) && "Outside this trip's dates", pr.note && "Currency not converted", status === "pending" && "Not confirmed yet", status === "cancelled" && "Cancelled"].filter(Boolean),
+      });
+      return;
+    }
+
+    if (b.type === "transfer") {
+      const date = cleanDate(b.date);
+      const d = destFor(trip, date, date ? addDays(date, 1) : "", b.from, b.to);
+      const pr = priceIn(b.totalPrice, b.currency);
+      const mode = TRANSFER_MODES[b.mode] ? b.mode : "booked";
+      const notes = [
+        b.meetingPoint && `Meet at ${b.meetingPoint}`, b.contact && `Contact ${b.contact}`, b.vehicle,
+        b.paid === true ? "Paid" : b.paid === false ? "Pay on the day" : "", pr.note, via, status === "pending" && "Not confirmed yet",
+      ].filter(Boolean).join(". ");
+      const obj = normTransfer({
+        destId: d?.id || "", from: b.from || "", to: b.to || "", date, time: b.time || "", mode,
+        cost: pr.value, currency: pr.currency, link: b.link || "", notes, booked, confirmation: (b.confirmation || "").toString().trim(), source: "email",
+      });
+      const air = (s) => /airport|机场|aeroporto|aeropuerto|\b[A-Z]{3}\b/i.test(s || "");
+      const matches = transfersOf(trip).filter((x) =>
+        x.date === date && ((air(x.from) && air(b.from)) || (air(x.to) && air(b.to)) || similarName(x.to, b.to) || similarName(x.from, b.from)));
+      out.push({
+        key: `t${bi}`, kind: "transfer", status, obj, include: status !== "cancelled" || matches.length > 0,
+        ticks: { paid: b.paid === true, pickup: !!(b.time && b.meetingPoint), contact: !!b.contact },
+        target: matches[0]?.id || "new",
+        matches: matches.map((x) => ({ id: x.id, label: `${transferTitle(x)} (${shortDate(x.date)})` })),
+        title: `${b.from || "?"} → ${b.to || "?"}`,
+        sub: [TRANSFER_MODES[mode][0], shortDate(date), b.time, pr.value !== null ? money(toUSD(pr.value, pr.currency, state.settings), state.settings) : null, obj.confirmation].filter(Boolean).join(" · "),
+        warnings: [!nearTrip(trip, date) && "Outside this trip's dates", pr.note && "Currency not converted", status === "pending" && "Not confirmed yet", status === "cancelled" && "Cancelled"].filter(Boolean),
+      });
+    }
+  });
+  // Bookings clearly for another trip start unticked.
+  out.forEach((p) => { if (p.warnings?.includes("Outside this trip's dates")) p.include = false; });
+  return out;
+}
+
+function tickTransfer(x, p) {
+  if (!p.obj.booked) return;
+  x.tasks.forEach((k) => {
+    if (/^booked$|^requested with the hotel$/i.test(k.text)) k.done = true;
+    if (/^paid$/i.test(k.text) && p.ticks?.paid) k.done = true;
+    if (/pickup time and meeting point/i.test(k.text) && p.ticks?.pickup) k.done = true;
+    if (/driver or company contact/i.test(k.text) && p.ticks?.contact) k.done = true;
+  });
+}
+
+// Applies one reviewed proposal to the trip (mutates t).
+function applyProposal(t, p) {
+  const o = p.obj;
+  const merge = (x, keys) => keys.forEach((k) => { if (hasText(o[k])) x[k] = o[k]; });
+  const cancel = (x) => { x.booked = false; x.selected = false; x.notes = addNote(x.notes, "Cancelled per booking email"); };
+
+  if (p.kind === "flight") {
+    let x = p.target !== "new" && t.flights.find((f) => f.id === p.target);
+    if (p.status === "cancelled") { if (x) cancel(x); return; }
+    if (x) {
+      merge(x, ["route", "date", "operating", "marketing", "flightNo", "durationH", "fareClass", "pricePP", "currency", "travelerIds", "link", "confirmation"]);
+      x.stops = o.stops; x.cabin = o.cabin; x.basic = o.basic;
+      x.notes = addNote(x.notes, o.notes);
+      x.booked = o.booked; x.selected = true;
+      if (x.source === "ai") x.source = "email";
+    } else {
+      x = clone(o);
+      t.flights.push(x);
+    }
+    t.flights.forEach((f) => { if (f.id !== x.id && f.leg === x.leg) f.selected = false; });
+    return;
+  }
+
+  if (p.kind === "hotel") {
+    let x = p.target !== "new" && t.hotels.find((h) => h.id === p.target);
+    if (p.status === "cancelled") { if (x) cancel(x); return; }
+    if (x) {
+      merge(x, ["name", "total", "currency", "nights", "link", "confirmation"]);
+      if (!x.area && o.area) x.area = o.area;
+      if (!x.destId && o.destId) x.destId = o.destId;
+      if (p.channelFromEmail) x.channel = p.channelFromEmail;
+      x.notes = addNote(x.notes === "Candidate. Add the Booking.com price." ? "" : x.notes, o.notes);
+      x.booked = o.booked; x.selected = true;
+    } else {
+      x = clone(o);
+      t.hotels.push(x);
+    }
+    t.hotels.forEach((h) => { if (h.id !== x.id && h.destId === x.destId) h.selected = false; });
+    return;
+  }
+
+  if (p.kind === "transfer") {
+    t.transfers = transfersOf(t);
+    let x = p.target !== "new" && t.transfers.find((y) => y.id === p.target);
+    if (p.status === "cancelled") { if (x) cancel(x); return; }
+    if (x) {
+      const untouched = !x.tasks.some((k) => k.done) && x.tasks.every((k) => (TRANSFER_MODES[x.mode]?.[1] || []).includes(k.text));
+      merge(x, ["from", "to", "date", "time", "cost", "currency", "link", "confirmation", "destId"]);
+      if (o.mode !== x.mode) { x.mode = o.mode; if (untouched) x.tasks = transferTasks(o.mode); }
+      x.notes = addNote(x.notes, o.notes);
+      x.booked = o.booked;
+    } else {
+      x = clone(o);
+      t.transfers.push(x);
+    }
+    tickTransfer(x, p);
+  }
+}
+
+const KIND_ICON = { flight: Plane, hotel: BedDouble, transfer: CarFront, note: Info };
+
+function ImportPanel({ trip, state, updTrip, onClose, onDone }) {
+  const [pasted, setPasted] = useState("");
+  const [files, setFiles] = useState([]);
+  const [busy, setBusy] = useState("");
+  const [err, setErr] = useState("");
+  const [review, setReview] = useState(null); // { props, warnings, ignored }
+  const [drag, setDrag] = useState(false);
+  const fileRef = useRef(null);
+  const ai = aiConfig();
+  const ready = aiReady();
+
+  const addFiles = (list) => {
+    const picked = Array.from(list || []); // copy now: the input's FileList is cleared right after
+    if (picked.length) setFiles((fs) => [...fs, ...picked]);
+  };
+  const onPaste = (e) => {
+    const imgs = Array.from(e.clipboardData?.files || []).filter((f) => f.type.startsWith("image/"));
+    if (imgs.length) { e.preventDefault(); addFiles(imgs.map((f, i) => new File([f], f.name && f.name !== "image.png" ? f.name : `screenshot-${Date.now()}-${i}.png`, { type: f.type }))); }
+  };
+
+  const read = async () => {
+    setErr(""); setReview(null);
+    try {
+      setBusy("Reading files…");
+      const inp = await readInputs(files, pasted);
+      if (!inp.text && !inp.images.length) throw new Error(inp.warnings[0] || "Nothing to read yet. Paste the email or add a file");
+      setBusy(`Asking ${ai.label}…`);
+      const res = await askAI({
+        system: IMPORT_SYSTEM,
+        text: `${importPrompt(trip, state)}\n\n=== BOOKING MATERIAL (${inp.sources.join(", ") || "images"}) ===\n${inp.text || "(see the attached images)"}`,
+        images: inp.images,
+        maxTokens: 4000,
+      });
+      const props = buildProposals(res, trip, state);
+      if (!props.length) throw new Error(res?.ignored ? `No flights, hotels or transfers found. The email mentions: ${res.ignored}` : "No flights, hotels or transfers found in this email");
+      setReview({ props, warnings: inp.warnings, ignored: res?.ignored || "" });
+    } catch (e) {
+      setErr(e.message || String(e));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const setProp = (key, patch) => setReview((r) => ({ ...r, props: r.props.map((p) => (p.key === key ? { ...p, ...patch } : p)) }));
+  const chosen = review ? review.props.filter((p) => p.include && p.kind !== "note") : [];
+  const apply = () => {
+    updTrip((t) => chosen.forEach((p) => applyProposal(t, p)));
+    const upd = chosen.filter((p) => p.target !== "new").length;
+    const parts = [chosen.length - upd && `added ${chosen.length - upd}`, upd && `updated ${upd}`].filter(Boolean).join(", ");
+    onDone(`${parts.charAt(0).toUpperCase()}${parts.slice(1)} from the email.`, chosen[0]?.kind);
+  };
+
+  return (
+    <section className="panel p-4 mb-5" style={{ borderColor: "var(--gold)" }} aria-label="Import a booking">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h2 className="display text-xl font-bold">Import a booking</h2>
+          <p className="text-sm muted">
+            Paste a confirmation email, or add the .eml, PDF voucher or a screenshot. Flights, hotels and transfers are read out and matched to what you've already logged; nothing is saved until you confirm.
+          </p>
+        </div>
+        <button className="btn btn-quiet" aria-label="Close import" onClick={onClose}><X size={16} /></button>
+      </div>
+
+      {!ready && (
+        <div className="verdict text-sm mt-3">
+          Set up an AI provider first: Wallet and rules → This device → AI features. DeepSeek, Qwen, Kimi and GLM work without a VPN.
+        </div>
+      )}
+
+      {!review && (
+        <div
+          className="mt-3 grid gap-3"
+          onDragOver={(e) => { e.preventDefault(); setDrag(true); }}
+          onDragLeave={() => setDrag(false)}
+          onDrop={(e) => { e.preventDefault(); setDrag(false); addFiles(e.dataTransfer.files); }}
+          style={drag ? { outline: "2px dashed var(--gold)", outlineOffset: 4, borderRadius: 8 } : undefined}
+        >
+          <F label="Email text">
+            <textarea rows={6} value={pasted} onChange={(e) => setPasted(e.target.value)} onPaste={onPaste} placeholder="Paste the whole confirmation email here (screenshots can be pasted too)" />
+          </F>
+          <div className="flex flex-wrap items-center gap-2">
+            <input ref={fileRef} type="file" multiple hidden accept=".eml,.mht,.txt,.html,.htm,.pdf,message/rfc822,application/pdf,text/*,image/*" onChange={(e) => { addFiles(e.target.files); e.target.value = ""; }} />
+            <button className="btn" onClick={() => fileRef.current?.click()}><Paperclip size={14} /> Add files</button>
+            {files.map((f, i) => (
+              <span key={i} className="chip">
+                {f.name}
+                <button aria-label={`Remove ${f.name}`} onClick={() => setFiles((fs) => fs.filter((_, j) => j !== i))} style={{ background: "none", border: 0, cursor: "pointer", padding: 0, display: "inline-flex" }}><X size={12} /></button>
+              </span>
+            ))}
+            <span className="text-xs muted">.eml, PDF, HTML, text or images{files.length ? "" : "; you can also drop them here"}</span>
+          </div>
+          <div className="flex flex-wrap items-center gap-3">
+            <AIButton busy={!!busy} onClick={read}>Read booking</AIButton>
+            {busy ? <span className="text-sm muted" role="status">{busy}</span> : (
+              <span className="text-xs muted">Sent from this browser to {ai.label} only; delete what you don't want from the text first.</span>
+            )}
+          </div>
+          <ErrorLine msg={err} />
+        </div>
+      )}
+
+      {review && (
+        <div className="mt-4">
+          <p className="font-semibold mb-2">Found {review.props.filter((p) => p.kind !== "note").length}. Tick what to save:</p>
+          <ul className="space-y-2">
+            {review.props.map((p) => {
+              const Icon = KIND_ICON[p.kind] || Info;
+              return (
+                <li key={p.key} className="panel p-3 flex flex-wrap items-center gap-3">
+                  {p.kind !== "note" && (
+                    <input type="checkbox" aria-label={`Include ${p.title}`} checked={p.include} onChange={(e) => setProp(p.key, { include: e.target.checked })} />
+                  )}
+                  <Icon size={16} aria-hidden="true" />
+                  <div className="min-w-0 flex-1">
+                    <div className="font-semibold">{p.title}</div>
+                    <div className="text-sm muted num">{p.sub}</div>
+                    {!!p.warnings.length && <div className="flex flex-wrap gap-1 mt-1">{p.warnings.map((w) => <Chip key={w} s="warn">{w}</Chip>)}</div>}
+                  </div>
+                  {p.kind !== "note" && (
+                    <select value={p.target} onChange={(e) => setProp(p.key, { target: e.target.value })} style={{ width: "auto", maxWidth: 280 }} aria-label="Save as">
+                      {p.status !== "cancelled" && <option value="new">Add as new</option>}
+                      {p.matches.map((m) => <option key={m.id} value={m.id}>{p.status === "cancelled" ? "Mark cancelled: " : "Update: "}{m.label}</option>)}
+                    </select>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+          {review.ignored && <p className="text-sm muted mt-2">Not imported: {review.ignored}</p>}
+          {review.warnings.map((w) => <p key={w} className="text-sm muted mt-1">{w}</p>)}
+          <p className="text-xs muted mt-2">Updated and new items are marked Booked and Picked; other options for the same leg or stay are unpicked.</p>
+          <div className="flex flex-wrap gap-2 mt-3">
+            <button className="btn btn-solid" disabled={!chosen.length} onClick={apply}><Check size={14} /> Save {chosen.length} to {trip.name}</button>
+            <button className="btn btn-quiet" onClick={() => setReview(null)}>Back</button>
+          </div>
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -2341,7 +2794,14 @@ function DevicePanel({ device, onSave, sync, onSyncNow }) {
   const [d, setD] = useState(device);
   const [showToken, setShowToken] = useState(false);
   const [showKey, setShowKey] = useState(false);
+  const [test, setTest] = useState(null);
   useEffect(() => { setD(device); }, [device]);
+  const prov = AI_PROVIDERS[d.aiProvider] ? d.aiProvider : "anthropic";
+  const runTest = async () => {
+    setTest("busy");
+    try { await testAI(d); setTest({ ok: true, text: `Working. ${aiConfig(d).label} answered from this browser.` }); }
+    catch (e) { setTest({ ok: false, text: e.message }); }
+  };
   const changed = JSON.stringify(d) !== JSON.stringify(device);
   const connected = syncConfigured(device);
   const set = (k) => (e) => setD({ ...d, [k]: e.target.value });
@@ -2387,19 +2847,36 @@ function DevicePanel({ device, onSave, sync, onSyncNow }) {
       </p>
 
       <h3 className="font-semibold mt-6 mb-2 flex items-center gap-2"><Sparkles size={15} aria-hidden="true" /> AI features (optional)</h3>
-      <p className="text-sm muted mb-2">Drafting itinerary days and suggesting missing packing items. Everything else works without this.</p>
+      <p className="text-sm muted mb-2">Importing bookings from emails, drafting itinerary days and suggesting packing items. Everything else works without this.</p>
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-        <F label="Anthropic API key" className="sm:col-span-2">
-          <input type={showKey ? "text" : "password"} value={d.aiKey} onChange={set("aiKey")} placeholder="sk-ant-…" autoComplete="off" autoCapitalize="off" />
+        <F label="Provider" className="sm:col-span-2">
+          <select value={prov} onChange={(e) => { const p = AI_PROVIDERS[e.target.value]; setTest(null); setD({ ...d, aiProvider: e.target.value, aiBase: p.base, aiModel: p.model, aiVisionModel: p.visionModel }); }}>
+            {Object.entries(AI_PROVIDERS).map(([k, p]) => <option key={k} value={k}>{p.label}</option>)}
+          </select>
         </F>
-        <F label="Model"><input value={d.aiModel} onChange={set("aiModel")} autoCapitalize="off" /></F>
-        <label className="flex items-center gap-2 self-end pb-2 text-sm">
+        <F label="API key" className="sm:col-span-2">
+          <input type={showKey ? "text" : "password"} value={d.aiKey} onChange={set("aiKey")} placeholder={AI_PROVIDERS[prov].keyHint} autoComplete="off" autoCapitalize="off" />
+        </F>
+        <F label="Endpoint" className="sm:col-span-2">
+          <input value={d.aiBase || ""} onChange={set("aiBase")} placeholder={AI_PROVIDERS[prov].base || "https://…/v1"} autoCapitalize="off" autoCorrect="off" />
+        </F>
+        <F label="Model"><input value={d.aiModel} onChange={set("aiModel")} autoCapitalize="off" autoCorrect="off" /></F>
+        {prov !== "anthropic" ? (
+          <F label="Vision model (screenshots)"><input value={d.aiVisionModel ?? AI_PROVIDERS[prov].visionModel} onChange={set("aiVisionModel")} placeholder="none" autoCapitalize="off" autoCorrect="off" /></F>
+        ) : <div />}
+        <label className="flex items-center gap-2 text-sm">
           <input type="checkbox" checked={showKey} onChange={(e) => setShowKey(e.target.checked)} /> Show key
         </label>
       </div>
+      <p className="text-xs muted mt-2">{AI_PROVIDERS[prov].note} Calls go straight from this browser to the provider; the key never syncs.</p>
       <div className="flex flex-wrap items-center gap-2 mt-3">
         <button className="btn" disabled={!changed} onClick={() => onSave(d)}>Save</button>
-        <span className="text-xs muted">Calls go straight from this browser to Anthropic and need a VPN on a mainland network.</span>
+        <button className="btn btn-quiet" disabled={!d.aiKey || test === "busy"} onClick={runTest}>
+          {test === "busy" ? <Loader2 size={14} className="spin" /> : <RefreshCw size={14} />} Test connection
+        </button>
+        {test && test !== "busy" && (
+          <span className="text-sm" role="status" style={{ color: test.ok ? "var(--ok)" : "var(--bad)" }}>{test.text}</span>
+        )}
       </div>
     </section>
   );
