@@ -9,8 +9,9 @@ import { askAI, aiConfig, aiReady, testAI, AI_PROVIDERS } from "./ai.js";
 import { readInputs } from "./emailinput.js";
 import {
   getDevice, setDevice, syncConfigured, loadLocal, saveLocal, getMeta, setMeta,
-  pull, push, ConflictError, NetworkError,
+  pull, push, ConflictError, NetworkError, loadBase, saveBase,
 } from "./sync.js";
+import { mergeStates, deepEqual } from "./merge.js";
 
 /* ------------------------------------------------------------------ */
 /* Constants                                                           */
@@ -679,33 +680,46 @@ export default function TravelHQ() {
     try {
       const meta = getMeta(d);
       const local = stateRef.current;
+      // Settle on `result` as the copy now on GitHub, keeping any edits made here
+      // while the network calls were running.
+      const finish = async (result, sha) => {
+        const now = stateRef.current;
+        let final = result;
+        let dirty = false;
+        if (now !== local) {
+          final = mergeStates(local, now, result).state;
+          dirty = !deepEqual(final, result);
+        }
+        if (final !== now) { stateRef.current = final; setState(final); await saveLocal(final); }
+        await saveBase(result, d);
+        setMeta({ sha, dirty, lastSyncedAt: Date.now() }, d);
+        if (dirty) { clearTimeout(pushTimer.current); pushTimer.current = setTimeout(() => runSync(), 3000); }
+      };
       const remote = await pull(d);
       let note = "";
       if (!remote) {
         const sha = await push(local, null, d);
-        setMeta({ sha, dirty: false, lastSyncedAt: Date.now() }, d);
+        await finish(local, sha);
         note = `Created ${d.path} in ${d.repo}`;
       } else if (remote.sha === meta.sha) {
         if (meta.dirty) {
           const sha = await push(local, remote.sha, d);
-          setMeta({ sha, dirty: false, lastSyncedAt: Date.now() }, d);
+          await finish(local, sha);
         } else {
-          setMeta({ lastSyncedAt: Date.now() }, d);
+          await finish(local, remote.sha);
         }
+      } else if (!meta.dirty || isBlank(local)) {
+        await finish(migrate(remote.data), remote.sha);
+        note = meta.sha ? "Loaded changes from another device" : "Loaded your data from GitHub";
       } else {
-        const remoteNewer = (remote.data?.updatedAt || 0) >= (local.updatedAt || 0);
-        if (!meta.dirty || remoteNewer || isBlank(local)) {
-          const data = migrate(remote.data);
-          stateRef.current = data;
-          setState(data);
-          await saveLocal(data);
-          setMeta({ sha: remote.sha, dirty: false, lastSyncedAt: Date.now() }, d);
-          note = meta.sha ? "Loaded changes from another device" : "Loaded your data from GitHub";
-        } else {
-          const sha = await push(local, remote.sha, d);
-          setMeta({ sha, dirty: false, lastSyncedAt: Date.now() }, d);
-          note = "Changes here were newer, so they replaced GitHub's copy";
-        }
+        // Both this device and someone else changed things: combine them.
+        const base = await loadBase(d);
+        const { state: merged, conflicts } = mergeStates(base ? migrate(base) : null, local, migrate(remote.data));
+        const sha = await push(merged, remote.sha, d);
+        await finish(merged, sha);
+        note = conflicts
+          ? `Combined your changes with someone else's; ${conflicts} field${conflicts === 1 ? "" : "s"} edited on both sides kept the latest edit`
+          : "Combined your changes with someone else's";
       }
       retryRef.current = 0;
       setSync({ kind: "synced", text: note, at: Date.now() });
@@ -742,9 +756,12 @@ export default function TravelHQ() {
       if (document.visibilityState === "visible" || getMeta().dirty) runSync();
     };
     const onOnline = () => runSync();
+    // While the app is open, look for other people's edits every couple of minutes.
+    const poll = setInterval(() => { if (document.visibilityState === "visible" && syncConfigured()) runSync(); }, 120000);
     document.addEventListener("visibilitychange", onVis);
     window.addEventListener("online", onOnline);
     return () => {
+      clearInterval(poll);
       document.removeEventListener("visibilitychange", onVis);
       window.removeEventListener("online", onOnline);
     };
@@ -2928,6 +2945,7 @@ function DevicePanel({ device, onSave, sync, onSyncNow }) {
         <F label="Private data repo"><input value={d.repo} onChange={set("repo")} placeholder="travel-hq-data" autoCapitalize="off" autoCorrect="off" /></F>
         <F label="Branch"><input value={d.branch} onChange={set("branch")} placeholder="main" autoCapitalize="off" /></F>
         <F label="File"><input value={d.path} onChange={set("path")} placeholder="travel-hq.json" autoCapitalize="off" /></F>
+        <F label="Your name (shows who synced in GitHub's history)"><input value={d.name || ""} onChange={set("name")} placeholder="Felipe" /></F>
         <F label="Access token (fine-grained, this repo only)" className="sm:col-span-2 lg:col-span-3">
           <input type={showToken ? "text" : "password"} value={d.token} onChange={set("token")} placeholder="github_pat_…" autoComplete="off" autoCapitalize="off" />
         </F>
@@ -2949,6 +2967,20 @@ function DevicePanel({ device, onSave, sync, onSyncNow }) {
       <p className="text-xs muted mt-2">
         If this device has no trips yet, connecting loads everything from GitHub. If the file doesn't exist, this device's data creates it.
       </p>
+
+      <details className="mt-4">
+        <summary className="font-semibold cursor-pointer">Share Travel HQ with someone</summary>
+        <div className="text-sm mt-2 space-y-2">
+          <p>Everyone connected to the same data repo sees and edits the same trips. Edits made at different times are combined; if two people change the very same field, the later edit wins. Anyone you share with sees everything here, including your wallet and rules.</p>
+          <ol className="list-decimal pl-5 space-y-1">
+            <li>On GitHub: Settings → Developer settings → Personal access tokens → Fine-grained tokens → <strong>Generate new token</strong>. Name it after the person (e.g. "Travel HQ – Lucia").</li>
+            <li>Repository access: <strong>Only select repositories</strong> → <code>{device.repo || "travel-hq-data"}</code>. Permissions → <strong>Contents: Read and write</strong>, nothing else.</li>
+            <li>Send them the app link, the token, and these two values: username <code>{device.owner || "fesil03"}</code>, repo <code>{device.repo || "travel-hq-data"}</code>.</li>
+            <li>On their phone or computer: open the link → Wallet and rules → This device → fill in username, repo, their name and the token → <strong>Save and sync</strong>.</li>
+          </ol>
+          <p className="muted">To stop sharing with one person, delete their token on GitHub. Nobody else is affected. They don't need a GitHub account.</p>
+        </div>
+      </details>
 
       <h3 className="font-semibold mt-6 mb-2 flex items-center gap-2"><Sparkles size={15} aria-hidden="true" /> AI features (optional)</h3>
       <p className="text-sm muted mb-2">Importing bookings from emails, drafting itinerary days and suggesting packing items. Everything else works without this.</p>

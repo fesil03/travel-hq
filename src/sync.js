@@ -13,9 +13,9 @@ const META_KEY = "travelhq:syncmeta";
 
 export function getDevice() {
   try {
-    return { owner: "", repo: "", branch: "main", path: "travel-hq.json", token: "", aiProvider: "anthropic", aiKey: "", aiModel: "claude-sonnet-5", aiBase: "", ...JSON.parse(localStorage.getItem(DEVICE_KEY) || "{}") };
+    return { owner: "", repo: "", branch: "main", path: "travel-hq.json", name: "", token: "", aiProvider: "anthropic", aiKey: "", aiModel: "claude-sonnet-5", aiBase: "", ...JSON.parse(localStorage.getItem(DEVICE_KEY) || "{}") };
   } catch (e) {
-    return { owner: "", repo: "", branch: "main", path: "travel-hq.json", token: "", aiProvider: "anthropic", aiKey: "", aiModel: "claude-sonnet-5", aiBase: "" };
+    return { owner: "", repo: "", branch: "main", path: "travel-hq.json", name: "", token: "", aiProvider: "anthropic", aiKey: "", aiModel: "claude-sonnet-5", aiBase: "" };
   }
 }
 export function setDevice(d) {
@@ -61,6 +61,19 @@ export function setMeta(patch, d = getDevice()) {
   try { all = JSON.parse(localStorage.getItem(META_KEY) || "{}"); } catch (e) { all = {}; }
   all[metaId(d)] = { ...getMeta(d), ...patch };
   localStorage.setItem(META_KEY, JSON.stringify(all));
+}
+
+// The copy this device last agreed on with GitHub. Lets sync tell who changed
+// what, so edits from different people are combined instead of overwritten.
+const baseKey = (d) => `travelhq:base:${metaId(d)}`;
+export async function loadBase(d = getDevice()) {
+  try { const v = await get(baseKey(d)); if (v) return v; } catch (e) { /* fall back */ }
+  try { const raw = localStorage.getItem(baseKey(d)); return raw ? JSON.parse(raw) : null; } catch (e) { return null; }
+}
+export async function saveBase(state, d = getDevice()) {
+  try { await set(baseKey(d), state); } catch (e) {
+    try { localStorage.setItem(baseKey(d), JSON.stringify(state)); } catch (e2) { /* best effort */ }
+  }
 }
 
 /* ---------- GitHub contents API ---------- */
@@ -135,7 +148,7 @@ export async function pull(d = getDevice()) {
 // Writes the file. Returns the new sha. Throws ConflictError if GitHub's copy moved.
 export async function push(state, sha, d = getDevice()) {
   const body = {
-    message: `Travel HQ sync ${new Date().toISOString().slice(0, 16).replace("T", " ")}`,
+    message: `Travel HQ sync${d.name?.trim() ? ` by ${d.name.trim()}` : ""} ${new Date().toISOString().slice(0, 16).replace("T", " ")}`,
     content: b64enc(JSON.stringify(state, null, 2) + "\n"),
     branch: d.branch || "main",
   };

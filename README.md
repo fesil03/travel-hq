@@ -40,7 +40,15 @@ Open the same URL, add it to the home screen, enter the same three sync fields �
 - Edits save on the device instantly and push to GitHub about 6 seconds after you stop typing.
 - Opening or returning to the app pulls changes from other devices.
 - Offline: edits stay on the device and push when you're back online.
-- If two devices both changed things before syncing, the most recent edit wins for the whole file. Anything overwritten is still in the data repo's commit history.
+- While the app is open it also checks for other people's edits every couple of minutes.
+- If two devices or people changed things before syncing, the changes are combined item by item (hotels, flights, transfers, packing items, checklist steps, rules…): additions from both sides are kept, deletions are respected unless the other side edited that item. Only when both changed the very same field does the later edit win. Every sync is a commit, so anything overwritten is still in the data repo's history.
+
+## Sharing with other people
+Everyone connected to the same data repo sees and edits the same data, including your wallet and rules.
+1. Create one fine-grained token per person (name it after them): Only select repositories → `travel-hq-data`, Contents: Read and write.
+2. Send them the app link, the token, username `fesil03` and repo `travel-hq-data`.
+3. They open the link → Wallet and rules → This device → fill those in plus their name → Save and sync. No GitHub account needed.
+4. To stop sharing with someone, delete their token. Their name appears in commit messages ("Travel HQ sync by Lucia").
 - The token and optional AI key live only in that browser's storage. Anyone with access to the unlocked device could read them; revoke the token on GitHub if a device is lost.
 
 ## Network notes (mainland China)
@@ -57,4 +65,4 @@ npm install
 npm run dev      # http://localhost:5173/travel-hq/
 npm run build
 ```
-Main code: `src/App.jsx` (UI, rules, booking import), `src/sync.js` (local storage and GitHub sync), `src/ai.js` (AI providers), `src/emailinput.js` (reading .eml, PDF, HTML and images).
+Main code: `src/App.jsx` (UI, rules, booking import), `src/sync.js` (local storage and GitHub sync), `src/merge.js` (combining edits from several people), `src/ai.js` (AI providers), `src/emailinput.js` (reading .eml, PDF, HTML and images).
