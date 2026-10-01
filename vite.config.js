@@ -29,6 +29,19 @@ export default defineConfig({
         globPatterns: ["**/*.{js,css,html,svg,png,woff2}"],
         // never cache API traffic: GitHub, Open-Meteo, exchange rates, Anthropic
         navigateFallbackDenylist: [/^\/api/],
+        // Map tiles seen once stay available offline (e.g. checking a day's
+        // stops on the metro). Up to ~3000 tiles, kept 60 days.
+        runtimeCaching: [
+          {
+            urlPattern: /^https:\/\/([a-d]\.basemaps\.cartocdn\.com|tile\.openstreetmap\.org)\//,
+            handler: "CacheFirst",
+            options: {
+              cacheName: "map-tiles",
+              expiration: { maxEntries: 3000, maxAgeSeconds: 60 * 24 * 3600 },
+              cacheableResponse: { statuses: [0, 200] },
+            },
+          },
+        ],
       },
     }),
   ],

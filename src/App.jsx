@@ -1,9 +1,9 @@
-import { useState, useEffect, useMemo, useRef, useCallback } from "react";
+import { useState, useEffect, useMemo, useRef, useCallback, lazy, Suspense } from "react";
 import {
   Plane, BedDouble, CalendarDays, CloudSun, Luggage, LayoutGrid, Wallet, Plus, Trash2,
   Sparkles, Check, ChevronDown, ChevronRight, AlertTriangle, CheckCircle2, Info, Loader2,
   RefreshCw, ArrowLeftRight, XCircle, ExternalLink, Cloud, CloudOff, Download, Upload, CarFront,
-  Mail, X, Paperclip,
+  Mail, X, Paperclip, Map as MapIcon,
 } from "lucide-react";
 import { askAI, aiConfig, aiReady, testAI, AI_PROVIDERS } from "./ai.js";
 import { readInputs } from "./emailinput.js";
@@ -12,6 +12,10 @@ import {
   pull, push, ConflictError, NetworkError, loadBase, saveBase,
 } from "./sync.js";
 import { mergeStates, deepEqual } from "./merge.js";
+import { mapOf } from "./maps.js";
+
+// The map (Leaflet) loads only when the Map tab is opened.
+const MapTab = lazy(() => import("./MapTab.jsx"));
 
 /* ------------------------------------------------------------------ */
 /* Constants                                                           */
@@ -381,6 +385,7 @@ function newTrip(travelers) {
     travelerIds: travelers.map((t) => t.id),
     destinations: [{ id: "d_" + uid(), name: "Destination", start, end }],
     flights: [], hotels: [], transfers: [], days: {}, weather: {}, packing: [], notes: "",
+    map: { days: [], places: [] },
   };
 }
 
@@ -875,6 +880,7 @@ const SUBTABS = [
   ["hotels", "Hotels", BedDouble],
   ["transfers", "Transfers", CarFront],
   ["itinerary", "Itinerary", CalendarDays],
+  ["map", "Map", MapIcon],
   ["weather", "Weather", CloudSun],
   ["packing", "Packing", Luggage],
 ];
@@ -883,6 +889,7 @@ function TripView({ trip, state, update, updTrip }) {
   const [tab, setTab] = useState("overview");
   const [importing, setImporting] = useState(false);
   const [flash, setFlash] = useState("");
+  const [mapFocus, setMapFocus] = useState(null);
   useEffect(() => { if (!flash) return; const t = setTimeout(() => setFlash(""), 6000); return () => clearTimeout(t); }, [flash]);
   useEffect(() => { setImporting(false); }, [trip.id]);
   const st = state.settings;
@@ -966,7 +973,19 @@ function TripView({ trip, state, update, updTrip }) {
       {tab === "flights" && <FlightsTab trip={trip} state={state} updTrip={updTrip} />}
       {tab === "hotels" && <HotelsTab trip={trip} state={state} updTrip={updTrip} />}
       {tab === "transfers" && <TransfersTab trip={trip} state={state} updTrip={updTrip} />}
-      {tab === "itinerary" && <ItineraryTab trip={trip} state={state} updTrip={updTrip} />}
+      {tab === "itinerary" && <ItineraryTab trip={trip} state={state} updTrip={updTrip} onOpenMap={(dayId) => { setMapFocus(dayId); setTab("map"); }} />}
+      {tab === "map" && (
+        <Suspense fallback={<div className="panel p-6 muted flex items-center gap-2"><Loader2 size={16} className="spin" /> Loading map…</div>}>
+          <MapTab
+            trip={trip}
+            updTrip={updTrip}
+            tripDates={tripDateList(trip)}
+            fmtDate={fmtDate}
+            focusDay={mapFocus}
+            onFocusUsed={() => setMapFocus(null)}
+          />
+        </Suspense>
+      )}
       {tab === "weather" && <WeatherTab trip={trip} updTrip={updTrip} />}
       {tab === "packing" && <PackingTab trip={trip} state={state} update={update} updTrip={updTrip} />}
     </div>
@@ -2152,13 +2171,23 @@ function destForDay(trip, date) {
     trip.destinations.find((d) => date === d.end) || null;
 }
 
-function ItineraryTab({ trip, state, updTrip }) {
+const tripDateList = (trip) => {
+  if (!validD(trip.start)) return [];
+  const n = Math.min(nightsBetween(trip.start, trip.end) + 1, 60);
+  return Array.from({ length: n }, (_, i) => addDays(trip.start, i));
+};
+
+function ItineraryTab({ trip, state, updTrip, onOpenMap }) {
   const [busy, setBusy] = useState(null);
   const [err, setErr] = useState("");
   const [overwrite, setOverwrite] = useState(false);
   const total = nightsBetween(trip.start, trip.end);
   const dates = validD(trip.start) ? Array.from({ length: Math.min(total + 1, 60) }, (_, i) => addDays(trip.start, i)) : [];
   const people = state.travelers.filter((t) => trip.travelerIds.includes(t.id));
+  const tripMap = mapOf(trip);
+  const mapDaysOn = (date) => tripMap.days.filter((d) => d.date === date).map((d) => ({
+    d, stops: tripMap.places.filter((p) => p.dayId === d.id).sort((a, b) => (a.order ?? 0) - (b.order ?? 0)),
+  }));
 
   const draft = async (d) => {
     setBusy(d.id); setErr("");
@@ -2213,13 +2242,24 @@ Format: [{"d":"YYYY-MM-DD","plan":"one line under 25 words"}] with one entry per
                 <div className="text-xs mt-1 font-semibold">{d?.name || ""}</div>
                 {(i === 0 || i === dates.length - 1 || isMove) && <span className="chip chip-warn mt-1">Travel day</span>}
               </div>
-              <textarea
-                aria-label={`Plan for ${fmtDate(date)}`}
-                rows={2}
-                value={trip.days[date]?.notes || ""}
-                placeholder="Plans, bookings, reservations"
-                onChange={(e) => updTrip((t) => { t.days[date] = { ...(t.days[date] || {}), notes: e.target.value }; })}
-              />
+              <div className="space-y-2 min-w-0">
+                <textarea
+                  aria-label={`Plan for ${fmtDate(date)}`}
+                  rows={2}
+                  value={trip.days[date]?.notes || ""}
+                  placeholder="Plans, bookings, reservations"
+                  onChange={(e) => updTrip((t) => { t.days[date] = { ...(t.days[date] || {}), notes: e.target.value }; })}
+                />
+                {mapDaysOn(date).map(({ d: md, stops }) => (
+                  <button key={md.id} className="text-left text-sm w-full flex items-start gap-2" style={{ background: "none", border: "none", padding: 0, color: "inherit", cursor: "pointer" }} onClick={() => onOpenMap?.(md.id)}>
+                    <MapIcon size={14} className="mt-0.5 flex-none" style={{ color: md.color }} aria-hidden="true" />
+                    <span className="min-w-0">
+                      <span className="font-semibold">{md.label}</span>
+                      <span className="muted"> · {stops.length} stop{stops.length === 1 ? "" : "s"}{stops.length ? `: ${stops.map((p) => p.name).join(" → ")}` : ""}</span>
+                    </span>
+                  </button>
+                ))}
+              </div>
             </li>
           );
         })}

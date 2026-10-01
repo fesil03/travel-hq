@@ -1,6 +1,6 @@
 # Travel HQ
 
-Personal trip planner: one tab per trip with flight and hotel logs checked against your booking rules, costs per night and per destination (split stays across several hotels supported), ground transfers with a pre-trip checklist per leg, itinerary, weather and packing presets.
+Personal trip planner: one tab per trip with flight and hotel logs checked against your booking rules, costs per night and per destination (split stays across several hotels supported), ground transfers with a pre-trip checklist per leg, itinerary, a day-by-day map (import from Google My Maps), weather and packing presets.
 
 - **App (public repo `travel-hq`)**: static site on GitHub Pages at https://fesil03.github.io/travel-hq/. Contains no personal data.
 - **Data (private repo `travel-hq-data`)**: one file, `travel-hq.json`. Every sync is a commit, so the repo history is your version history.
@@ -57,6 +57,7 @@ Everyone connected to the same data repo sees and edits the same data, including
 - Exchange rates: Frankfurter (ECB rates), no key. Rates can always be typed in.
 - GitHub API can be slow or blocked without a VPN; the app keeps working locally and syncs later.
 - AI features (importing bookings from emails, itinerary drafts, packing suggestions) are optional and use your own API key, set per device under Wallet and rules → This device. Providers: Claude (needs a VPN on a mainland network), DeepSeek, Qwen, Kimi, GLM, or any OpenAI-compatible endpoint. Use *Test connection* to confirm a provider accepts calls from the browser.
+- **Map** (on each trip): Import My Maps (.kmz/.kml) — in Google My Maps, ⋮ next to the title → Export to KML/KMZ. Each layer becomes a day; layers named "Day N" land on the Nth day of the trip (change any day's date with its pencil). Re-importing skips places already on the map. Days show numbered stops joined in order; reorder with the arrows or *Shortest order*, move stops between days, add places by search (OpenStreetMap), a Google Maps link with coordinates, or tapping the map. Every stop opens in Google or Apple Maps, with leg-by-leg transit directions. Base map tiles come from CARTO or OpenStreetMap (no key); tiles you've viewed are cached for offline use. If tiles don't load on a mainland network, switch base map or use a VPN — pins, order and links still work. Map days with a date also appear on the Itinerary tab.
 - **Import booking** (on each trip): paste a confirmation email or add the `.eml`, PDF voucher or screenshots. Flights, hotels and transfers are extracted, matched to what's already logged, and shown for review; confirmed items are marked Booked with their confirmation number. Email text goes only to the AI provider you picked.
 
 ## Development
@@ -65,4 +66,4 @@ npm install
 npm run dev      # http://localhost:5173/travel-hq/
 npm run build
 ```
-Main code: `src/App.jsx` (UI, rules, booking import), `src/sync.js` (local storage and GitHub sync), `src/merge.js` (combining edits from several people), `src/ai.js` (AI providers), `src/emailinput.js` (reading .eml, PDF, HTML and images).
+Main code: `src/App.jsx` (UI, rules, booking import), `src/MapTab.jsx` + `src/maps.js` (trip map, KMZ/KML import), `src/sync.js` (local storage and GitHub sync), `src/merge.js` (combining edits from several people), `src/ai.js` (AI providers), `src/emailinput.js` (reading .eml, PDF, HTML and images).
