@@ -1,6 +1,6 @@
 # Travel HQ
 
-Personal trip planner: one tab per trip with flight and hotel logs checked against your booking rules, costs per night and per destination (split stays across several hotels supported), ground transfers with a pre-trip checklist per leg, itinerary, a day-by-day map (import from Google My Maps), weather and packing presets.
+Personal trip planner: one tab per trip with colour-coded readiness tiles, flight and hotel logs checked against your booking rules, a costs breakdown (per hotel, per night, per person), ground transfers with pre-trip checklists, trains/buses/ferries/rental cars (Rail & road), itinerary, a day-by-day map (import from Google My Maps), weather and packing presets. Paste your own packing list or day-by-day plan and it's sorted for you.
 
 - **App (public repo `travel-hq`)**: static site on GitHub Pages at https://fesil03.github.io/travel-hq/. Contains no personal data.
 - **Data (private repo `travel-hq-data`)**: one file, `travel-hq.json`. Every sync is a commit, so the repo history is your version history.
@@ -60,10 +60,17 @@ Everyone connected to the same data repo sees and edits the same data, including
 - **Map** (on each trip): Import My Maps (.kmz/.kml) — in Google My Maps, ⋮ next to the title → Export to KML/KMZ. Each layer becomes a day; layers named "Day N" land on the Nth day of the trip (change any day's date with its pencil). Re-importing skips places already on the map. Days show numbered stops joined in order; reorder with the arrows or *Shortest order*, move stops between days, add places by search (OpenStreetMap), a Google Maps link with coordinates, or tapping the map. Every stop opens in Google or Apple Maps, with leg-by-leg transit directions. Base map tiles come from CARTO or OpenStreetMap (no key); tiles you've viewed are cached for offline use. If tiles don't load on a mainland network, switch base map or use a VPN — pins, order and links still work. Map days with a date also appear on the Itinerary tab.
 - **Import booking** (on each trip): paste a confirmation email or add the `.eml`, PDF voucher or screenshots. Flights, hotels and transfers are extracted, matched to what's already logged, and shown for review; confirmed items are marked Booked with their confirmation number. Email text goes only to the AI provider you picked.
 
+## Versions, releases and rolling back
+- `main` is what's live. New work happens on a branch (`feature/…`), is built and tested, then merged into `main` and tagged `vMAJOR.MINOR.PATCH`. Each tag has a GitHub Release with notes; [CHANGELOG.md](CHANGELOG.md) lists them all.
+- The version a device is running shows at the bottom of Wallet and rules.
+- **Roll back the app** to an earlier version without losing history: `git revert --no-edit <first-bad-commit>^..main && git push`, or put a tag's code back with `git checkout v1.5.0 -- . && git commit -m "Roll back to v1.5.0" && git push`. Pages redeploys in about a minute.
+- **Your data** is versioned separately: every sync is a commit in the private `travel-hq-data` repo, so any earlier copy of `travel-hq.json` can be restored from its history (or from a backup file via Wallet and rules → Backup).
+- App versions only ever add fields to the data, so an older version still reads newer data.
+
 ## Development
 ```bash
 npm install
 npm run dev      # http://localhost:5173/travel-hq/
 npm run build
 ```
-Main code: `src/App.jsx` (UI, rules, booking import), `src/MapTab.jsx` + `src/maps.js` (trip map, KMZ/KML import), `src/sync.js` (local storage and GitHub sync), `src/merge.js` (combining edits from several people), `src/ai.js` (AI providers), `src/emailinput.js` (reading .eml, PDF, HTML and images).
+Main code: `src/App.jsx` (UI, rules, booking import, costs, readiness, paste-a-list), `src/MapTab.jsx` + `src/maps.js` (trip map, KMZ/KML import), `src/sync.js` (local storage and GitHub sync), `src/merge.js` (combining edits from several people), `src/ai.js` (AI providers), `src/emailinput.js` (reading .eml, PDF, HTML and images).

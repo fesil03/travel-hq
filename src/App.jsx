@@ -3,7 +3,7 @@ import {
   Plane, BedDouble, CalendarDays, CloudSun, Luggage, LayoutGrid, Wallet, Plus, Trash2,
   Sparkles, Check, ChevronDown, ChevronRight, AlertTriangle, CheckCircle2, Info, Loader2,
   RefreshCw, ArrowLeftRight, XCircle, ExternalLink, Cloud, CloudOff, Download, Upload, CarFront,
-  Mail, X, Paperclip, Map as MapIcon,
+  Mail, X, Paperclip, Map as MapIcon, TrainFront, Bus, Ship, Car, Route, Receipt, UserPlus, ClipboardPaste,
 } from "lucide-react";
 import { askAI, aiConfig, aiReady, testAI, AI_PROVIDERS } from "./ai.js";
 import { readInputs } from "./emailinput.js";
@@ -89,6 +89,17 @@ const TRANSFER_MODES = {
   other: ["Other", []],
 };
 const transferTasks = (mode) => (TRANSFER_MODES[mode]?.[1] || []).map((text) => ({ id: uid(), text, done: false }));
+
+// Rail & road: trains, buses, ferries and rental cars between places.
+// [label, icon, priced per person by default]
+const OVERLAND_KINDS = {
+  train: ["Train", TrainFront, true],
+  bus: ["Bus", Bus, true],
+  ferry: ["Ferry", Ship, true],
+  car: ["Rental car", Car, false],
+  other: ["Other", Route, false],
+};
+const MAX_TRAVELERS = 6;
 
 const PACK_CATS = ["Documents", "Tech", "Clothing", "Shoes", "Toiletries", "Other"];
 const BAGS = ["Backpack", "Suitcase", "Wear on travel day"];
@@ -382,11 +393,69 @@ function newTrip(travelers) {
     id: "trip_" + uid(),
     name: "New trip",
     start, end,
-    travelerIds: travelers.map((t) => t.id),
+    travelerIds: travelers.slice(0, MAX_TRAVELERS).map((t) => t.id),
     destinations: [{ id: "d_" + uid(), name: "Destination", start, end }],
-    flights: [], hotels: [], transfers: [], days: {}, weather: {}, packing: [], notes: "",
+    flights: [], hotels: [], transfers: [], overland: [], days: {}, weather: {}, packing: [], notes: "",
     map: { days: [], places: [] },
   };
+}
+
+const transfersOf = (trip) => (Array.isArray(trip?.transfers) ? trip.transfers : []);
+const overlandOf = (trip) => (Array.isArray(trip?.overland) ? trip.overland : []);
+const tripPeople = (trip, state) => (trip.travelerIds || []).map((id) => state.travelers.find((p) => p.id === id)).filter(Boolean);
+
+const normOverland = (o = {}) => {
+  const kind = OVERLAND_KINDS[o.kind] ? o.kind : "train";
+  return {
+    id: o.id || uid(),
+    kind,
+    from: o.from || "",
+    to: o.to || "",
+    date: validD(o.date) ? o.date : "",
+    time: o.time || "",
+    arrive: o.arrive || "",
+    endDate: validD(o.endDate) ? o.endDate : "",
+    operator: o.operator || "",
+    number: o.number || "",
+    seat: o.seat || "",
+    price: numOrNull(o.price),
+    currency: CURRENCIES.includes(o.currency) ? o.currency : "USD",
+    per: o.per === "person" || o.per === "total" ? o.per : OVERLAND_KINDS[kind][2] ? "person" : "total",
+    travelerIds: Array.isArray(o.travelerIds) ? o.travelerIds : [],
+    booked: !!o.booked,
+    confirmation: o.confirmation || "",
+    link: o.link || "",
+    notes: o.notes || "",
+    source: o.source || "manual",
+  };
+};
+const overlandUSD = (x, st) => {
+  const v = toUSD(x.price, x.currency, st);
+  if (v === null) return null;
+  return x.per === "person" ? v * Math.max(1, (x.travelerIds || []).length) : v;
+};
+
+// Adding someone to a trip also adds them to options you're still comparing:
+// unbooked flights and per-person rail/road tickets that covered everyone.
+// Booked items stay exactly as booked. Returns false when the trip is full.
+function setTripTraveler(t, personId, on) {
+  const before = [...(t.travelerIds || [])];
+  const coversAll = (ids) => before.every((id) => (ids || []).includes(id));
+  const legs = [...t.flights, ...overlandOf(t).filter((x) => x.per === "person")];
+  if (on) {
+    if (before.includes(personId)) return true;
+    if (before.length >= MAX_TRAVELERS) return false;
+    t.travelerIds = [...before, personId];
+    legs.forEach((x) => {
+      if (!x.booked && coversAll(x.travelerIds) && !(x.travelerIds || []).includes(personId)) x.travelerIds = [...(x.travelerIds || []), personId];
+    });
+  } else {
+    t.travelerIds = before.filter((id) => id !== personId);
+    [...t.flights, ...overlandOf(t)].forEach((x) => {
+      if (!x.booked) x.travelerIds = (x.travelerIds || []).filter((id) => id !== personId);
+    });
+  }
+  return true;
 }
 
 const normTransfer = (o = {}) => ({
@@ -485,11 +554,110 @@ function tripCosts(trip, st) {
     };
   });
   const hotelUSD = dests.reduce((a, x) => a + (x.total || 0), 0);
+  const hotelRows = dests.flatMap(({ d, hotels }) => hotels.map((h) => {
+    const n = hotelNights(h, d);
+    const total = toUSD(h.total, h.currency, st);
+    const [ci, co] = hotelRange(h, d);
+    return { h, d, nights: n, total, perNight: total !== null && n ? total / n : null, checkIn: ci, checkOut: co };
+  }));
+  const pricedHotelNights = hotelRows.filter((r) => r.total !== null).reduce((a, r) => a + r.nights, 0);
+  const transfers = transfersOf(trip).map((x) => ({ x, usd: toUSD(x.cost, x.currency, st) }));
+  const transferUSD = transfers.reduce((a, r) => a + (r.usd || 0), 0);
+  const overland = overlandOf(trip).map((x) => ({ x, usd: overlandUSD(x, st) }));
+  const overlandTotal = overland.reduce((a, r) => a + (r.usd || 0), 0);
   const nights = nightsBetween(trip.start, trip.end);
-  const grand = flightUSD + hotelUSD;
+  const grand = flightUSD + hotelUSD + transferUSD + overlandTotal;
   const pax = Math.max(1, trip.travelerIds.length);
-  return { flights, flightUSD, dests, hotelUSD, grand, nights, pax, perPerson: grand / pax, perNight: nights ? grand / nights : null };
+  return {
+    flights, flightUSD, dests, hotelUSD, hotelRows, hotelPerNight: pricedHotelNights ? hotelUSD / pricedHotelNights : null,
+    hotelNightsCovered: hotelRows.reduce((a, r) => a + r.nights, 0),
+    transfers, transferUSD, overland, overlandUSD: overlandTotal,
+    grand, nights, pax, perPerson: grand / pax, perNight: nights ? grand / nights : null,
+  };
 }
+
+/* ---------------- Readiness (the coloured status tiles) ---------------- */
+
+const legType = (f) => (/^return/i.test(f.leg || "") ? "Return" : /^outbound/i.test(f.leg || "") ? "Outbound" : "Internal");
+const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
+
+// level: "ok" (green), "warn" (amber: chosen but not booked or not done),
+// "bad" (red: something missing), "none" (grey: nothing logged).
+function tripStatus(trip, state, costs) {
+  const people = tripPeople(trip, state);
+  const who = people.length ? people : [{ id: null, name: "Everyone" }];
+
+  // Flights: every traveler needs an outbound and a return flight picked, then booked.
+  const picked = trip.flights.filter((f) => f.selected);
+  const fMissing = [], fPending = [];
+  who.forEach((p) => ["Outbound", "Return"].forEach((L) => {
+    const fs = picked.filter((f) => legType(f) === L && (p.id === null || !(f.travelerIds || []).length || f.travelerIds.includes(p.id)));
+    if (!fs.length) fMissing.push(`${p.name}: no ${L.toLowerCase()} flight picked`);
+    else if (fs.some((f) => !f.booked)) fPending.push(`${p.name}: ${L.toLowerCase()} picked, not booked yet`);
+  }));
+  picked.filter((f) => legType(f) === "Internal" && !f.booked).forEach((f) => fPending.push(`${f.route || "Internal flight"}: picked, not booked yet`));
+  const flights = fMissing.length
+    ? { level: "bad", text: fMissing.length === 1 ? fMissing[0] : `${fMissing.length} flights missing`, issues: [...fMissing, ...fPending] }
+    : fPending.length
+      ? { level: "warn", text: `${plural(fPending.length, "flight")} not booked`, issues: fPending }
+      : { level: "ok", text: "All booked", issues: [] };
+
+  // Stays: every night covered by a picked hotel, then booked.
+  const sMissing = [], sPending = [];
+  costs.dests.forEach(({ d, hotels, gaps }) => {
+    if (!hotels.length) sMissing.push(`${d.name}: no hotel picked`);
+    else if (gaps.length) sMissing.push(`${d.name}: no hotel for ${gaps.map(fmtDate).join(", ")}`);
+    hotels.filter((h) => !h.booked).forEach((h) => sPending.push(`${h.name || "Hotel"}: picked, not booked yet`));
+  });
+  const gapNights = costs.dests.reduce((a, x) => a + (x.hotels.length ? x.gaps.length : x.nights), 0);
+  const stays = sMissing.length
+    ? { level: "bad", text: gapNights ? `${plural(gapNights, "night")} without a hotel` : "Hotel missing", issues: [...sMissing, ...sPending] }
+    : sPending.length
+      ? { level: "warn", text: `${plural(sPending.length, "stay")} not booked`, issues: sPending }
+      : { level: "ok", text: "Every night booked", issues: [] };
+
+  // Transfers: checklist steps done.
+  const tr = transfersOf(trip);
+  const steps = tr.reduce((a, x) => a + x.tasks.length, 0);
+  const stepsDone = tr.reduce((a, x) => a + x.tasks.filter((k) => k.done).length, 0);
+  const tIssues = tr.filter((x) => x.tasks.some((k) => !k.done))
+    .map((x) => `${transferTitle(x)}${x.date ? ` (${fmtDate(x.date)})` : ""}: ${x.tasks.filter((k) => k.done).length} of ${x.tasks.length} steps`);
+  const transfers = !tr.length
+    ? { level: "none", text: "None logged", issues: [] }
+    : tIssues.length
+      ? { level: "warn", text: `${stepsDone} of ${steps} steps done`, issues: tIssues }
+      : { level: "ok", text: "All ready", issues: [] };
+
+  // Rail & road: every leg booked.
+  const ov = overlandOf(trip);
+  const oIssues = ov.filter((x) => !x.booked).map((x) => `${OVERLAND_KINDS[x.kind][0]} ${x.from || "?"} → ${x.to || "?"}${x.date ? ` (${fmtDate(x.date)})` : ""}: not booked yet`);
+  const overland = !ov.length
+    ? { level: "none", text: "None logged", issues: [] }
+    : oIssues.length
+      ? { level: "warn", text: `${oIssues.length} of ${ov.length} not booked`, issues: oIssues }
+      : { level: "ok", text: "All booked", issues: [] };
+
+  // Packing.
+  const pk = trip.packing || [];
+  const packed = pk.filter((x) => x.done).length;
+  const packing = !pk.length
+    ? { level: "none", text: "List empty", issues: [] }
+    : packed === pk.length
+      ? { level: "ok", text: "All packed", issues: [] }
+      : { level: "warn", text: `${packed} of ${pk.length} packed`, issues: [] };
+
+  return { flights, stays, transfers, overland, packing };
+}
+
+// [status key, label, icon, tab it opens, cost key]
+const STATUS_TILES = [
+  ["flights", "Flights", Plane, "flights", "flightUSD"],
+  ["stays", "Stays", BedDouble, "hotels", "hotelUSD"],
+  ["transfers", "Transfers", CarFront, "transfers", "transferUSD"],
+  ["overland", "Rail & road", TrainFront, "overland", "overlandUSD"],
+  ["packing", "Packing", Luggage, "packing", null],
+];
+const LEVEL_ICON = { ok: CheckCircle2, warn: AlertTriangle, bad: XCircle, none: Info };
 
 function legVerdict(list, st) {
   const usd = (f) => toUSD(f.pricePP, f.currency, st);
@@ -580,7 +748,16 @@ font-family:'Instrument Sans',ui-sans-serif,system-ui,sans-serif;color:var(--ink
 .thq .verdict{background:var(--goldsoft);border-radius:8px;padding:10px 12px}
 .thq table{border-collapse:collapse;width:100%}
 .thq th{font-size:12px;font-weight:500;color:var(--muted);text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}
+.thq th.text-right{text-align:right}
 .thq td{padding:8px;border-bottom:1px solid #E3EBE8;vertical-align:top}
+.thq .tile{display:block;width:100%;text-align:left;border-radius:10px;padding:9px 12px;border:1px solid var(--line);background:#fff;color:var(--ink);cursor:pointer}
+.thq .tile:hover{filter:brightness(.98)}
+.thq .tile-ok{background:var(--oksoft);border-color:#BCDCCB}
+.thq .tile-warn{background:var(--goldsoft);border-color:#EBD38F}
+.thq .tile-bad{background:var(--badsoft);border-color:#E7BDB3}
+.thq .lv-ok{color:var(--ok)}.thq .lv-warn{color:#7A5608}.thq .lv-bad{color:var(--bad)}.thq .lv-none{color:var(--muted)}
+.thq .catrow td{background:#F4F8F6;font-weight:600;cursor:pointer}
+.thq .subrow td:first-child{padding-left:26px}
 .thq .spin{animation:thqspin 1s linear infinite}
 @keyframes thqspin{to{transform:rotate(360deg)}}
 @media (prefers-reduced-motion:reduce){.thq .spin{animation:none}}
@@ -876,9 +1053,11 @@ export default function TravelHQ() {
 
 const SUBTABS = [
   ["overview", "Overview", LayoutGrid],
+  ["costs", "Costs", Receipt],
   ["flights", "Flights", Plane],
   ["hotels", "Hotels", BedDouble],
   ["transfers", "Transfers", CarFront],
+  ["overland", "Rail & road", TrainFront],
   ["itinerary", "Itinerary", CalendarDays],
   ["map", "Map", MapIcon],
   ["weather", "Weather", CloudSun],
@@ -894,7 +1073,9 @@ function TripView({ trip, state, update, updTrip }) {
   useEffect(() => { setImporting(false); }, [trip.id]);
   const st = state.settings;
   const costs = useMemo(() => tripCosts(trip, st), [trip, st]);
-  const names = state.travelers.filter((t) => trip.travelerIds.includes(t.id)).map((t) => t.name);
+  const status = useMemo(() => tripStatus(trip, state, costs), [trip, state, costs]);
+  const names = tripPeople(trip, state).map((t) => t.name);
+  const joinNames = (a) => (a.length <= 2 ? a.join(" and ") : `${a.slice(0, -1).join(", ")} and ${a[a.length - 1]}`);
 
   return (
     <div>
@@ -905,7 +1086,7 @@ function TripView({ trip, state, update, updTrip }) {
             <h1 className="display text-4xl sm:text-5xl font-extrabold leading-none">{trip.name}</h1>
             <p className="muted mt-2">
               {fmtDate(trip.start)} to {fmtDate(trip.end)}, {costs.nights} night{costs.nights === 1 ? "" : "s"}
-              {names.length ? `, ${names.join(" and ")}` : ""}
+              {names.length ? `, ${joinNames(names)}` : ""}
             </p>
           </div>
           <div className="text-right">
@@ -935,11 +1116,23 @@ function TripView({ trip, state, update, updTrip }) {
               )}
             </div>
           ))}
-          <div className="seg" style={{ background: "var(--gold)", color: "var(--ink)", flexGrow: 0 }}>
-            <div className="font-semibold flex items-center gap-1"><Plane size={14} aria-hidden="true" /> Flights</div>
-            <div className="text-xs">{costs.flights.length} picked</div>
-            <div className="text-sm mt-1 num">{money(costs.flightUSD, st)}</div>
-          </div>
+        </div>
+
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2 mt-2" aria-label="Trip readiness">
+          {STATUS_TILES.map(([key, label, Icon, goTab, costKey]) => {
+            const x = status[key];
+            const LvIcon = LEVEL_ICON[x.level];
+            return (
+              <button key={key} className={`tile tile-${x.level}`} onClick={() => setTab(goTab)} aria-label={`${label}: ${x.text}. Open ${label}`}>
+                <div className="flex items-center gap-1.5 font-semibold">
+                  <Icon size={14} aria-hidden="true" /> {label}
+                  <LvIcon size={14} className={`ml-auto lv-${x.level}`} aria-hidden="true" />
+                </div>
+                <div className={`text-xs mt-0.5 lv-${x.level}`} style={{ fontWeight: 600 }}>{x.text}</div>
+                {costKey && costs[costKey] > 0 && <div className="text-sm num mt-0.5">{money(costs[costKey], st)}</div>}
+              </button>
+            );
+          })}
         </div>
       </section>
 
@@ -964,12 +1157,14 @@ function TripView({ trip, state, update, updTrip }) {
           onDone={(msg, kind) => {
             setImporting(false);
             setFlash(msg);
-            if (kind) setTab({ flight: "flights", hotel: "hotels", transfer: "transfers" }[kind] || tab);
+            if (kind) setTab({ flight: "flights", hotel: "hotels", transfer: "transfers", overland: "overland" }[kind] || tab);
           }}
         />
       )}
 
-      {tab === "overview" && <Overview trip={trip} state={state} update={update} updTrip={updTrip} costs={costs} />}
+      {tab === "overview" && <Overview trip={trip} state={state} update={update} updTrip={updTrip} status={status} onGo={setTab} />}
+      {tab === "costs" && <CostsTab trip={trip} state={state} costs={costs} />}
+      {tab === "overland" && <OverlandTab trip={trip} state={state} updTrip={updTrip} />}
       {tab === "flights" && <FlightsTab trip={trip} state={state} updTrip={updTrip} />}
       {tab === "hotels" && <HotelsTab trip={trip} state={state} updTrip={updTrip} />}
       {tab === "transfers" && <TransfersTab trip={trip} state={state} updTrip={updTrip} />}
@@ -994,146 +1189,267 @@ function TripView({ trip, state, update, updTrip }) {
 
 /* ---------------- Overview ---------------- */
 
-function Overview({ trip, state, update, updTrip, costs }) {
-  const st = state.settings;
+function Overview({ trip, state, update, updTrip, status, onGo }) {
   return (
     <div className="grid gap-6 lg:grid-cols-5">
-      <section className="panel p-4 lg:col-span-3">
-        <h2 className="display text-xl font-bold mb-3">Costs</h2>
-        <table>
-          <thead>
-            <tr><th>Item</th><th>Nights</th><th className="text-right">Per night</th><th className="text-right">Total</th><th className="text-right">{st.secondaryCurrency}</th></tr>
-          </thead>
-          <tbody className="num">
-            {costs.dests.map(({ d, nights, hotels, names, covered, gaps, unpriced, total, perNight }) => (
-              <tr key={d.id}>
-                <td>
-                  <div className="font-semibold">{d.name}</div>
-                  <div className="text-xs muted">{hotels.length ? names : "No hotel picked yet"}</div>
-                  {hotels.length > 0 && gaps.length > 0 && (
-                    <div className="text-xs" style={{ color: "#7A5608" }}>No hotel for {gaps.map(fmtDate).join(", ")}</div>
-                  )}
-                  {unpriced > 0 && <div className="text-xs muted">{unpriced} picked without a price</div>}
-                </td>
-                <td>{hotels.length ? covered : nights}</td>
-                <td className="text-right">{money(perNight, st)}</td>
-                <td className="text-right">{money(total, st)}</td>
-                <td className="text-right muted">{money(total, st, st.secondaryCurrency)}</td>
-              </tr>
-            ))}
-            {costs.flights.map((f) => {
-              const pax = Math.max(1, f.travelerIds.length);
-              const tot = (toUSD(f.pricePP, f.currency, st) || 0) * pax;
-              return (
-                <tr key={f.id}>
-                  <td><div className="font-semibold">{f.leg}</div><div className="text-xs muted">{f.route || "Route"} {f.flightNo}, {pax} traveler{pax === 1 ? "" : "s"}</div></td>
-                  <td />
-                  <td className="text-right muted">{money(toUSD(f.pricePP, f.currency, st), st)} pp</td>
-                  <td className="text-right">{money(tot, st)}</td>
-                  <td className="text-right muted">{money(tot, st, st.secondaryCurrency)}</td>
-                </tr>
-              );
-            })}
-            {!costs.flights.length && (
-              <tr><td colSpan={5} className="muted">No flights picked yet. Pick the ones you're taking in Flights.</td></tr>
-            )}
-            <tr>
-              <td className="font-semibold">Hotels subtotal</td><td /><td />
-              <td className="text-right font-semibold">{money(costs.hotelUSD, st)}</td>
-              <td className="text-right muted">{money(costs.hotelUSD, st, st.secondaryCurrency)}</td>
-            </tr>
-            <tr>
-              <td className="font-semibold">Flights subtotal</td><td /><td />
-              <td className="text-right font-semibold">{money(costs.flightUSD, st)}</td>
-              <td className="text-right muted">{money(costs.flightUSD, st, st.secondaryCurrency)}</td>
-            </tr>
-            <tr>
-              <td className="display text-lg font-bold">Trip total</td>
-              <td>{costs.nights}</td>
-              <td className="text-right">{money(costs.perNight, st)}</td>
-              <td className="text-right display text-lg font-bold">{money(costs.grand, st)}</td>
-              <td className="text-right muted">{money(costs.grand, st, st.secondaryCurrency)}</td>
-            </tr>
-          </tbody>
-        </table>
-        <p className="text-xs muted mt-3">
-          Converted at your saved rates{st.fxUpdated ? ` (updated ${st.fxUpdated})` : ""}. Change them in Wallet and rules.
+      <TripDetails trip={trip} state={state} update={update} updTrip={updTrip} />
+      <section className="panel p-4 lg:col-span-2 space-y-4 self-start min-w-0">
+        <h2 className="display text-xl font-bold">What's left to do</h2>
+        {STATUS_TILES.map(([key, label, Icon, goTab]) => {
+          const x = status[key];
+          const LvIcon = LEVEL_ICON[x.level];
+          return (
+            <div key={key}>
+              <div className="flex items-center gap-2">
+                <LvIcon size={16} className={`lv-${x.level}`} aria-hidden="true" />
+                <span className="font-semibold">{label}</span>
+                <span className={`text-sm lv-${x.level}`}>{x.text}</span>
+                <button className="btn btn-quiet ml-auto text-xs" onClick={() => onGo(goTab)}>Open <ChevronRight size={12} /></button>
+              </div>
+              {x.issues.length > 0 && (
+                <ul className="text-sm muted mt-1 pl-6 space-y-0.5">
+                  {x.issues.slice(0, 6).map((t, i) => <li key={i}>{t}</li>)}
+                  {x.issues.length > 6 && <li>and {x.issues.length - 6} more</li>}
+                </ul>
+              )}
+            </div>
+          );
+        })}
+        <p className="text-xs muted">
+          Green: booked or done. Amber: chosen but not booked or not finished. Red: something missing. Grey: nothing logged yet.
         </p>
       </section>
-
-      <section className="panel p-4 lg:col-span-2 space-y-3">
-        <h2 className="display text-xl font-bold">Trip details</h2>
-        <F label="Trip name"><input value={trip.name} onChange={(e) => updTrip((t) => { t.name = e.target.value; })} /></F>
-        <div className="grid grid-cols-2 gap-2">
-          <F label="Start"><input type="date" value={trip.start} onChange={(e) => updTrip((t) => { t.start = e.target.value; })} /></F>
-          <F label="End"><input type="date" value={trip.end} onChange={(e) => updTrip((t) => { t.end = e.target.value; })} /></F>
-        </div>
-        <div>
-          <span className="lbl">Travelers</span>
-          <div className="flex flex-wrap gap-3">
-            {state.travelers.map((p) => (
-              <label key={p.id} className="flex items-center gap-1">
-                <input
-                  type="checkbox"
-                  checked={trip.travelerIds.includes(p.id)}
-                  onChange={(e) => updTrip((t) => {
-                    t.travelerIds = e.target.checked ? [...t.travelerIds, p.id] : t.travelerIds.filter((x) => x !== p.id);
-                  })}
-                />
-                {p.name}
-              </label>
-            ))}
-          </div>
-        </div>
-        <div>
-          <span className="lbl">Destinations, in order</span>
-          <div className="space-y-2">
-            {trip.destinations.map((d, i) => (
-              <div key={d.id} className="grid gap-2" style={{ gridTemplateColumns: "1.2fr 1fr 1fr auto" }}>
-                <input aria-label="Destination name" value={d.name} onChange={(e) => updTrip((t) => { t.destinations[i].name = e.target.value; })} />
-                <input aria-label="Arrive" type="date" value={d.start} onChange={(e) => updTrip((t) => { t.destinations[i].start = e.target.value; })} />
-                <input aria-label="Leave" type="date" value={d.end} onChange={(e) => updTrip((t) => { t.destinations[i].end = e.target.value; })} />
-                <button
-                  className="btn btn-quiet"
-                  aria-label={`Remove ${d.name}`}
-                  disabled={trip.destinations.length === 1}
-                  onClick={() => updTrip((t) => {
-                    t.destinations.splice(i, 1);
-                    t.hotels = t.hotels.filter((h) => h.destId !== d.id);
-                    delete t.weather[d.id];
-                  })}
-                ><Trash2 size={14} /></button>
-              </div>
-            ))}
-          </div>
-          <button
-            className="btn btn-quiet mt-2"
-            onClick={() => updTrip((t) => {
-              const last = t.destinations[t.destinations.length - 1];
-              const start = last?.end || t.start;
-              const end = t.end > start ? t.end : addDays(start, 2);
-              if (last && last.end === t.end) {
-                // split the last stop in half so the new one has room
-                const mid = addDays(last.start, Math.max(1, Math.floor(nightsBetween(last.start, last.end) / 2)));
-                last.end = mid;
-                t.destinations.push({ id: "d_" + uid(), name: "Next stop", start: mid, end: t.end });
-              } else {
-                t.destinations.push({ id: "d_" + uid(), name: "Next stop", start, end });
-              }
-            })}
-          ><Plus size={14} /> Add destination</button>
-        </div>
-        <F label="Notes (the AI reads these)">
-          <textarea rows={3} value={trip.notes} onChange={(e) => updTrip((t) => { t.notes = e.target.value; })} />
-        </F>
-        <div className="pt-2">
-          <ConfirmButton onConfirm={() => update((s) => {
-            s.trips = s.trips.filter((x) => x.id !== trip.id);
-            s.activeTripId = s.trips[0]?.id || null;
-          })}>Delete trip</ConfirmButton>
-        </div>
-      </section>
     </div>
+  );
+}
+
+function TripDetails({ trip, state, update, updTrip }) {
+  const people = tripPeople(trip, state);
+  const others = state.travelers.filter((p) => !trip.travelerIds.includes(p.id));
+  const full = people.length >= MAX_TRAVELERS;
+  const [newName, setNewName] = useState("");
+  const [newHome, setNewHome] = useState("");
+  const editPerson = (id, k, v) => update((s) => { const p = s.travelers.find((x) => x.id === id); if (p) p[k] = v; });
+  const addNew = () => {
+    const name = newName.trim();
+    if (!name || full) return;
+    const id = "t_" + uid();
+    update((s) => {
+      s.travelers.push({ id, name, home: newHome.trim().toUpperCase().slice(0, 3), notes: "" });
+      const t = s.trips.find((x) => x.id === trip.id);
+      if (t) setTripTraveler(t, id, true);
+    });
+    setNewName(""); setNewHome("");
+  };
+
+  return (
+    <section className="panel p-4 lg:col-span-3 space-y-4 min-w-0">
+      <h2 className="display text-xl font-bold">Trip details</h2>
+      <F label="Trip name"><input value={trip.name} onChange={(e) => updTrip((t) => { t.name = e.target.value; })} /></F>
+      <div className="grid gap-2" style={{ gridTemplateColumns: "minmax(0,1fr) minmax(0,1fr)" }}>
+        <F label="Start"><input type="date" value={trip.start} onChange={(e) => updTrip((t) => { t.start = e.target.value; })} /></F>
+        <F label="End"><input type="date" value={trip.end} onChange={(e) => updTrip((t) => { t.end = e.target.value; })} /></F>
+      </div>
+
+      <div>
+        <span className="lbl">Travelers ({people.length} of {MAX_TRAVELERS})</span>
+        <div className="space-y-2">
+          {people.map((p) => (
+            <div key={p.id} className="grid gap-2 items-center" style={{ gridTemplateColumns: "minmax(0,1fr) 72px auto" }}>
+              <input aria-label="Name" value={p.name} onChange={(e) => editPerson(p.id, "name", e.target.value)} />
+              <input aria-label={`${p.name}'s home airport`} value={p.home || ""} maxLength={3} placeholder="Home" onChange={(e) => editPerson(p.id, "home", e.target.value.toUpperCase())} />
+              <button className="btn btn-quiet" aria-label={`Take ${p.name} off this trip`} title="Take off this trip" onClick={() => updTrip((t) => { setTripTraveler(t, p.id, false); })}><X size={14} /></button>
+            </div>
+          ))}
+          {!people.length && <p className="text-sm muted">No one on this trip yet.</p>}
+        </div>
+        {others.length > 0 && (
+          <div className="flex flex-wrap items-center gap-2 mt-2">
+            <span className="text-xs muted">Add:</span>
+            {others.map((p) => (
+              <button key={p.id} className="chip" style={{ cursor: full ? "not-allowed" : "pointer" }} disabled={full} onClick={() => updTrip((t) => { setTripTraveler(t, p.id, true); })}>
+                <Plus size={12} aria-hidden="true" /> {p.name}
+              </button>
+            ))}
+          </div>
+        )}
+        <div className="grid gap-2 mt-2 items-center" style={{ gridTemplateColumns: "minmax(0,1fr) 72px auto" }}>
+          <input aria-label="New traveler's name" placeholder="New traveler's name" value={newName} disabled={full} onChange={(e) => setNewName(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") addNew(); }} />
+          <input aria-label="New traveler's home airport" placeholder="Home" maxLength={3} value={newHome} disabled={full} onChange={(e) => setNewHome(e.target.value.toUpperCase())} />
+          <button className="btn" disabled={full || !newName.trim()} onClick={addNew}><UserPlus size={14} /> Add</button>
+        </div>
+        <p className="text-xs muted mt-1">
+          {full ? `This trip has the maximum of ${MAX_TRAVELERS}. ` : ""}
+          New travelers are added to flight and rail options you haven't booked yet, so prices and the Flights tab update. Booked items stay as booked.
+        </p>
+      </div>
+
+      <div>
+        <span className="lbl">Destinations, in order</span>
+        <div className="space-y-2">
+          {trip.destinations.map((d, i) => (
+            <div key={d.id} className="grid gap-2 grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] sm:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)_minmax(0,1fr)_auto]">
+              <input aria-label="Destination name" className="col-span-2 sm:col-span-1" value={d.name} onChange={(e) => updTrip((t) => { t.destinations[i].name = e.target.value; })} />
+              <input aria-label="Arrive" type="date" className="row-start-2 sm:row-start-auto" value={d.start} onChange={(e) => updTrip((t) => { t.destinations[i].start = e.target.value; })} />
+              <input aria-label="Leave" type="date" className="row-start-2 sm:row-start-auto" value={d.end} onChange={(e) => updTrip((t) => { t.destinations[i].end = e.target.value; })} />
+              <button
+                className="btn btn-quiet"
+                aria-label={`Remove ${d.name}`}
+                disabled={trip.destinations.length === 1}
+                onClick={() => updTrip((t) => {
+                  t.destinations.splice(i, 1);
+                  t.hotels = t.hotels.filter((h) => h.destId !== d.id);
+                  delete t.weather[d.id];
+                })}
+              ><Trash2 size={14} /></button>
+            </div>
+          ))}
+        </div>
+        <button
+          className="btn btn-quiet mt-2"
+          onClick={() => updTrip((t) => {
+            const last = t.destinations[t.destinations.length - 1];
+            const start = last?.end || t.start;
+            const end = t.end > start ? t.end : addDays(start, 2);
+            if (last && last.end === t.end) {
+              // split the last stop in half so the new one has room
+              const mid = addDays(last.start, Math.max(1, Math.floor(nightsBetween(last.start, last.end) / 2)));
+              last.end = mid;
+              t.destinations.push({ id: "d_" + uid(), name: "Next stop", start: mid, end: t.end });
+            } else {
+              t.destinations.push({ id: "d_" + uid(), name: "Next stop", start, end });
+            }
+          })}
+        ><Plus size={14} /> Add destination</button>
+      </div>
+
+      <F label="Trip brief for the AI">
+        <textarea
+          rows={3}
+          value={trip.notes}
+          placeholder="e.g. Lucia is vegetarian. We prefer slow mornings and no flights before 8am. Budget around $150/night."
+          onChange={(e) => updTrip((t) => { t.notes = e.target.value; })}
+        />
+      </F>
+      <p className="text-xs muted -mt-2">
+        Read by every AI feature on this trip: importing booking emails, reading pasted packing and itinerary lists, drafting days and suggesting packing.
+        Use it for preferences and context, not for plans (those go in Itinerary).
+      </p>
+      <div className="pt-2">
+        <ConfirmButton onConfirm={() => update((s) => {
+          s.trips = s.trips.filter((x) => x.id !== trip.id);
+          s.activeTripId = s.trips[0]?.id || null;
+        })}>Delete trip</ConfirmButton>
+      </div>
+    </section>
+  );
+}
+
+/* ---------------- Costs ---------------- */
+
+function CostsTab({ trip, state, costs }) {
+  const st = state.settings;
+  const [closed, setClosed] = useState({});
+  const toggle = (k) => setClosed((c) => ({ ...c, [k]: !c[k] }));
+  const people = tripPeople(trip, state);
+  const nameOf = (id) => state.travelers.find((p) => p.id === id)?.name || "";
+  const cell = (usd) => (usd === null || usd === undefined ? <span className="muted">no price</span> : money(usd, st));
+
+  const LEG_ORDER = ["Outbound", "Internal", "Return"];
+  const flights = [...costs.flights].sort((a, b) => LEG_ORDER.indexOf(legType(a)) - LEG_ORDER.indexOf(legType(b)) || (a.date || "").localeCompare(b.date || ""));
+  const byDate = (a, b) => (a.x.date || "9999").localeCompare(b.x.date || "9999") || (a.x.time || "").localeCompare(b.x.time || "");
+
+  const Cat = ({ k, label, Icon, nights, perNight, total, count }) => (
+    <tr className="catrow" onClick={() => toggle(k)} aria-expanded={!closed[k]}>
+      <td>
+        <span className="inline-flex items-center gap-1.5">
+          {closed[k] ? <ChevronRight size={14} /> : <ChevronDown size={14} />}<Icon size={14} aria-hidden="true" /> {label}
+          <span className="muted font-normal text-xs">{count ? `(${count})` : ""}</span>
+        </span>
+      </td>
+      <td>{nights ?? ""}</td>
+      <td className="text-right">{perNight !== undefined ? money(perNight, st) : ""}</td>
+      <td className="text-right">{money(total, st)}</td>
+      <td className="text-right muted">{money(total, st, st.secondaryCurrency)}</td>
+    </tr>
+  );
+  const Sub = ({ main, sub, nights, perNight, total }) => (
+    <tr className="subrow">
+      <td><div>{main}</div>{sub && <div className="text-xs muted">{sub}</div>}</td>
+      <td>{nights ?? ""}</td>
+      <td className="text-right">{perNight ?? ""}</td>
+      <td className="text-right">{cell(total)}</td>
+      <td className="text-right muted">{total === null || total === undefined ? "" : money(total, st, st.secondaryCurrency)}</td>
+    </tr>
+  );
+  const Empty1 = ({ text }) => <tr className="subrow"><td colSpan={5} className="muted text-sm">{text}</td></tr>;
+
+  return (
+    <section className="panel p-4 overflow-x-auto">
+      <h2 className="display text-xl font-bold mb-1">Costs</h2>
+      <p className="text-sm muted mb-3">Picked and booked items only. Tap a category to fold it.</p>
+      <table style={{ minWidth: 560 }}>
+        <thead>
+          <tr><th>Item</th><th>Nights</th><th className="text-right">Per night</th><th className="text-right">Total</th><th className="text-right">{st.secondaryCurrency}</th></tr>
+        </thead>
+        <tbody className="num">
+          <Cat k="f" label="Flights" Icon={Plane} total={costs.flightUSD} count={flights.length} />
+          {!closed.f && (flights.length ? flights.map((f) => {
+            const pax = Math.max(1, (f.travelerIds || []).length);
+            const pp = toUSD(f.pricePP, f.currency, st);
+            const whoTxt = (f.travelerIds || []).length && f.travelerIds.length < people.length ? f.travelerIds.map(nameOf).filter(Boolean).join(", ") : `${pax} traveler${pax === 1 ? "" : "s"}`;
+            return (
+              <Sub key={f.id}
+                main={<>{legType(f)} <span className="muted">· {f.route || "route?"} {f.flightNo}</span>{f.booked && <span className="chip chip-ok ml-2">Booked</span>}</>}
+                sub={`${fmtDate(f.date)} · ${whoTxt}${pp !== null ? ` · ${money(pp, st)} pp` : ""}`}
+                total={pp === null ? null : pp * pax} />
+            );
+          }) : <Empty1 text="No flights picked yet." />)}
+
+          <Cat k="h" label="Accommodation" Icon={BedDouble} nights={costs.hotelNightsCovered || ""} perNight={costs.hotelPerNight} total={costs.hotelUSD} count={costs.hotelRows.length} />
+          {!closed.h && (costs.hotelRows.length ? costs.hotelRows.map((r) => (
+            <Sub key={r.h.id}
+              main={<>{r.h.name || "Unnamed hotel"}{r.h.booked && <span className="chip chip-ok ml-2">Booked</span>}</>}
+              sub={`${trip.destinations.length > 1 ? `${r.d.name} · ` : ""}${fmtDate(r.checkIn)} → ${fmtDate(r.checkOut)}`}
+              nights={r.nights} perNight={r.perNight === null ? "" : money(r.perNight, st)} total={r.total} />
+          )) : <Empty1 text="No hotels picked yet." />)}
+          {!closed.h && costs.dests.filter((x) => x.hotels.length && x.gaps.length).map((x) => (
+            <Empty1 key={x.d.id} text={`${x.d.name}: no hotel for ${x.gaps.map(fmtDate).join(", ")}`} />
+          ))}
+
+          <Cat k="t" label="Transfers" Icon={CarFront} total={costs.transferUSD} count={costs.transfers.length} />
+          {!closed.t && (costs.transfers.length ? [...costs.transfers].sort(byDate).map(({ x, usd }) => (
+            <Sub key={x.id} main={transferTitle(x)} sub={`${TRANSFER_MODES[x.mode]?.[0] || ""}${x.date ? ` · ${fmtDate(x.date)}` : ""}`} total={usd} />
+          )) : <Empty1 text="No transfers logged." />)}
+
+          <Cat k="o" label="Rail & road" Icon={TrainFront} total={costs.overlandUSD} count={costs.overland.length} />
+          {!closed.o && (costs.overland.length ? [...costs.overland].sort(byDate).map(({ x, usd }) => (
+            <Sub key={x.id}
+              main={<>{OVERLAND_KINDS[x.kind][0]} <span className="muted">· {x.from || "?"} → {x.to || "?"}</span>{x.booked && <span className="chip chip-ok ml-2">Booked</span>}</>}
+              sub={`${x.date ? fmtDate(x.date) : "No date"}${x.per === "person" && x.price !== null ? ` · ${money(toUSD(x.price, x.currency, st), st)} pp × ${Math.max(1, x.travelerIds.length)}` : ""}`}
+              total={usd} />
+          )) : <Empty1 text="No trains, buses, ferries or rental cars logged." />)}
+
+          <tr>
+            <td className="display text-lg font-bold">Trip total</td>
+            <td>{costs.nights}</td>
+            <td className="text-right">{money(costs.perNight, st)}</td>
+            <td className="text-right display text-lg font-bold">{money(costs.grand, st)}</td>
+            <td className="text-right muted">{money(costs.grand, st, st.secondaryCurrency)}</td>
+          </tr>
+          <tr>
+            <td className="muted">Per person ({costs.pax})</td>
+            <td />
+            <td className="text-right muted">{costs.perNight !== null ? money(costs.perNight / costs.pax, st) : "—"}</td>
+            <td className="text-right">{money(costs.perPerson, st)}</td>
+            <td className="text-right muted">{money(costs.perPerson, st, st.secondaryCurrency)}</td>
+          </tr>
+        </tbody>
+      </table>
+      <p className="text-xs muted mt-3">
+        Converted at your saved rates{st.fxUpdated ? ` (updated ${st.fxUpdated})` : ""}. Change them in Wallet and rules. Per night divides by the trip's {costs.nights} nights.
+      </p>
+    </section>
   );
 }
 
@@ -1539,7 +1855,6 @@ function HotelCard({ h, d, st, nights, isBest, open, setOpen, updTrip }) {
 
 /* ---------------- Transfers ---------------- */
 
-const transfersOf = (trip) => (Array.isArray(trip.transfers) ? trip.transfers : []);
 const transferTitle = (x) => `${x.from || "?"} → ${x.to || "?"}`;
 
 function TransfersTab({ trip, state, updTrip }) {
@@ -1720,6 +2035,152 @@ function TransferCard({ x, trip, st, open, setOpen, updTrip }) {
   );
 }
 
+/* ---------------- Rail & road ---------------- */
+
+function OverlandTab({ trip, state, updTrip }) {
+  const st = state.settings;
+  const [open, setOpen] = useState(null);
+  const people = tripPeople(trip, state);
+  const list = useMemo(
+    () => overlandOf(trip).slice().sort((a, b) => (a.date || "9999").localeCompare(b.date || "9999") || (a.time || "99:99").localeCompare(b.time || "99:99")),
+    [trip],
+  );
+  const booked = list.filter((x) => x.booked).length;
+  const total = list.reduce((a, x) => a + (overlandUSD(x, st) || 0), 0);
+
+  // Suggest the first move between destinations that has no leg yet.
+  const nextHop = () => {
+    const ds = trip.destinations;
+    for (let i = 0; i + 1 < ds.length; i++) {
+      const date = ds[i + 1].start;
+      if (!list.some((x) => x.date === date)) return { from: ds[i].name, to: ds[i + 1].name, date };
+    }
+    return { from: "", to: "", date: list[list.length - 1]?.date || trip.start };
+  };
+  const add = (kind) => {
+    const hop = kind === "car" ? { from: "", to: "", date: trip.start, endDate: trip.end } : nextHop();
+    const x = normOverland({ kind, ...hop, travelerIds: [...trip.travelerIds] });
+    updTrip((t) => { t.overland = overlandOf(t); t.overland.push(x); });
+    setOpen(x.id);
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h2 className="display text-2xl font-bold">Rail &amp; road</h2>
+          <p className="muted">
+            {list.length
+              ? `${plural(list.length, "leg")}, ${booked} booked${total > 0 ? `, ${money(total, st)}` : ""}`
+              : "Trains, buses, ferries and rental cars between places. Short rides to and from the airport go in Transfers."}
+          </p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          {Object.entries(OVERLAND_KINDS).filter(([k]) => k !== "other").map(([k, [label, Icon]]) => (
+            <button key={k} className={`btn ${k === "train" ? "btn-solid" : ""}`} onClick={() => add(k)}><Icon size={14} /> {label}</button>
+          ))}
+        </div>
+      </div>
+      {!list.length ? (
+        <Empty>Nothing logged. Add a train, bus, ferry or rental car above, or import the booking email.</Empty>
+      ) : (
+        <div className="space-y-2">
+          {list.map((x) => (
+            <OverlandCard key={x.id} x={x} trip={trip} st={st} people={people} open={open === x.id} setOpen={(o) => setOpen(o ? x.id : null)} updTrip={updTrip} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function OverlandCard({ x, trip, st, people, open, setOpen, updTrip }) {
+  const set = (k, v) => updTrip((t) => { const y = overlandOf(t).find((z) => z.id === x.id); if (y) y[k] = v; });
+  const [label, Icon] = OVERLAND_KINDS[x.kind] || OVERLAND_KINDS.other;
+  const isCar = x.kind === "car";
+  const usd = overlandUSD(x, st);
+  const pax = Math.max(1, x.travelerIds.length);
+  const when = x.date ? `${fmtDow(x.date)} ${fmtDate(x.date)}${x.time ? ` ${x.time}` : ""}${isCar && x.endDate ? ` → ${fmtDate(x.endDate)}` : ""}` : "No date";
+
+  return (
+    <div className={`panel ${x.booked ? "picked" : ""}`}>
+      <div className="flex flex-wrap items-center gap-3 p-3">
+        <button className="btn btn-quiet" aria-expanded={open} aria-label="Edit details" onClick={() => setOpen(!open)}>
+          {open ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+        </button>
+        <div className="min-w-0 flex-1">
+          <div className="font-semibold flex items-center gap-1.5">
+            <Icon size={15} aria-hidden="true" /> {x.from || "?"} → {x.to || "?"}
+            {x.source === "email" && <span className="chip chip-info ml-1">From email</span>}
+          </div>
+          <div className="flex flex-wrap gap-1 mt-1">
+            <span className="chip">{label}</span>
+            <span className="chip chip-info num">{when}</span>
+            {(x.operator || x.number) && <span className="chip">{[x.operator, x.number].filter(Boolean).join(" ")}</span>}
+            {x.booked ? <BookedChip x={x} /> : <Chip s="warn">Not booked</Chip>}
+          </div>
+          {!open && x.notes && <p className="text-sm muted mt-1">{x.notes}</p>}
+        </div>
+        <div className="text-right num">
+          <div className="font-bold">{usd === null ? <span className="muted font-normal">No price yet</span> : money(usd, st)}</div>
+          {usd !== null && <div className="text-xs muted">{x.per === "person" ? `${money(toUSD(x.price, x.currency, st), st)} pp × ${pax}` : money(usd, st, st.secondaryCurrency)}</div>}
+        </div>
+      </div>
+      {open && (
+        <div className="p-3 pt-0 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          <F label="Type">
+            <select value={x.kind} onChange={(e) => set("kind", e.target.value)}>
+              {Object.entries(OVERLAND_KINDS).map(([k, [l]]) => <option key={k} value={k}>{l}</option>)}
+            </select>
+          </F>
+          <F label={isCar ? "Pick up at" : "From"}><input value={x.from} onChange={(e) => set("from", e.target.value)} placeholder={isCar ? "Denpasar airport" : "Tokyo"} /></F>
+          <F label={isCar ? "Drop off at" : "To"}><input value={x.to} onChange={(e) => set("to", e.target.value)} placeholder={isCar ? "Same place" : "Kyoto"} /></F>
+          <F label={isCar ? "Pick-up date" : "Date"}><input type="date" value={x.date} onChange={(e) => set("date", e.target.value)} /></F>
+          {isCar ? (
+            <F label="Drop-off date"><input type="date" value={x.endDate} onChange={(e) => set("endDate", e.target.value)} /></F>
+          ) : (
+            <div className="grid grid-cols-2 gap-2">
+              <F label="Departs"><input type="time" value={x.time} onChange={(e) => set("time", e.target.value)} /></F>
+              <F label="Arrives"><input type="time" value={x.arrive} onChange={(e) => set("arrive", e.target.value)} /></F>
+            </div>
+          )}
+          <F label={isCar ? "Company" : "Operator"}><input value={x.operator} onChange={(e) => set("operator", e.target.value)} placeholder={isCar ? "e.g. Toyota Rent a Car" : "e.g. JR, Klook"} /></F>
+          <F label={isCar ? "Car class" : "Train / bus no."}><input value={x.number} onChange={(e) => set("number", e.target.value)} placeholder={isCar ? "Compact" : "Nozomi 21"} /></F>
+          <F label={isCar ? "Extras" : "Class / seat"}><input value={x.seat} onChange={(e) => set("seat", e.target.value)} placeholder={isCar ? "Full insurance" : "Green car, 8A"} /></F>
+          <F label="Price"><Num value={x.price} min={0} onChange={(v) => set("price", v)} /></F>
+          <F label="Currency"><CurSelect value={x.currency} onChange={(v) => set("currency", v)} /></F>
+          <F label="Price is">
+            <select value={x.per} onChange={(e) => set("per", e.target.value)}>
+              <option value="person">Per person</option>
+              <option value="total">Total for everyone</option>
+            </select>
+          </F>
+          <div>
+            <span className="lbl">For</span>
+            <div className="flex flex-wrap gap-2 pt-1">
+              {people.map((p) => (
+                <label key={p.id} className="flex items-center gap-1">
+                  <input type="checkbox" checked={x.travelerIds.includes(p.id)} onChange={(e) => set("travelerIds", e.target.checked ? [...x.travelerIds, p.id] : x.travelerIds.filter((id) => id !== p.id))} />
+                  {p.name}
+                </label>
+              ))}
+            </div>
+          </div>
+          <BookedFields x={x} set={set} />
+          <F label="Link" className="sm:col-span-2"><input value={x.link} onChange={(e) => set("link", e.target.value)} placeholder="https:// booking or timetable" /></F>
+          <F label="Notes" className="sm:col-span-2 lg:col-span-4"><textarea rows={2} value={x.notes} onChange={(e) => set("notes", e.target.value)} placeholder="Platform, where to collect tickets, luggage rules" /></F>
+          <div className="flex items-end gap-2 sm:col-span-2">
+            {/^https?:\/\//.test(x.link) && <a className="btn btn-quiet" href={x.link} target="_blank" rel="noreferrer"><ExternalLink size={14} /> Open</a>}
+            <button className="btn btn-quiet" style={{ color: "var(--bad)" }} onClick={() => updTrip((t) => { t.overland = overlandOf(t).filter((y) => y.id !== x.id); })}>
+              <Trash2 size={14} /> Remove
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ---------------- Import bookings from email ---------------- */
 
 const IMPORT_SYSTEM = "You read travel booking confirmations, e-tickets and vouchers (any language, including Chinese and Portuguese) and extract the bookings as structured data. You never invent details: anything not stated is null or an empty string.";
@@ -1730,14 +2191,16 @@ function importPrompt(trip, state) {
 - ${trip.name}, ${trip.start} to ${trip.end}
 - Destinations: ${trip.destinations.map((d) => `${d.name} (${d.start} to ${d.end})`).join("; ") || "none yet"}
 - Travellers: ${people.map((p) => `${p.name}${p.home ? ` (home airport ${p.home})` : ""}`).join("; ") || "not set"}
+- Trip brief: ${trip.notes || "none"}
 
-List every flight, hotel and ground transfer booked in the material below.
+List every flight, hotel, local transfer and rail/road journey booked in the material below.
 Rules:
 - Dates YYYY-MM-DD, times 24h HH:MM local time. Infer a missing year from context (bookings are for upcoming travel).
 - Airports as 3-letter IATA codes, airlines as 2-letter IATA codes (e.g. QR, CA, LA).
 - A flight booking has one journey per direction (outbound, return, or each hop of a multi-city). Connecting segments stay in one journey, with the connection airports in "via".
 - Amounts are plain numbers in the currency actually charged or due (ISO 4217 code), taxes and fees included. Give a journey's own price only if the email breaks it out.
-- Transfers cover airport pickups, private drivers, shuttles, pre-booked trains, buses or ferries, and car rentals.
+- "transfer" is a short local ride: airport pickups, private drivers, hotel shuttles, taxis.
+- "overland" is travel between places: trains (including airport express trains between cities), long-distance buses, ferries and boats, and car rentals. One entry per leg; a return train ticket is two entries.
 - status: "confirmed", "pending" (awaiting payment or confirmation) or "cancelled".
 - Use "ignored" for anything else in the email that is a booking but not one of these types (tours, restaurants, insurance).
 ${JSON_ONLY}
@@ -1746,7 +2209,8 @@ Schema:
  {"type":"flight","status":"confirmed","provider":"who sold it, e.g. Trip.com or Qatar Airways","confirmation":"PNR or booking ref","passengers":["full names"],"totalPrice":0,"currency":"CNY","paid":true,"link":"manage-booking URL or empty",
   "journeys":[{"from":"PEK","to":"DPS","via":["DOH"],"date":"YYYY-MM-DD","departTime":"HH:MM","arriveTime":"HH:MM","arriveDate":"YYYY-MM-DD","flightNumbers":["QR819","QR960"],"operatingCarrier":"QR","marketingCarrier":"QR","cabin":"Economy","fareClass":"N","basicEconomy":false,"durationHours":null,"price":null}]},
  {"type":"hotel","status":"confirmed","provider":"Booking.com","confirmation":"","loyalty":"miles or points programme mentioned, e.g. LATAM Pass or Avios","name":"","city":"","area":"","address":"","checkIn":"YYYY-MM-DD","checkOut":"YYYY-MM-DD","checkInTime":"","nights":null,"guests":null,"roomType":"","totalPrice":null,"currency":"","paid":false,"cancellation":"free cancellation deadline or policy","link":""},
- {"type":"transfer","status":"confirmed","provider":"","confirmation":"","from":"","to":"","date":"YYYY-MM-DD","time":"HH:MM","mode":"booked|shuttle|rental|public|taxi|app|other","meetingPoint":"","contact":"driver or company phone/WeChat","vehicle":"","totalPrice":null,"currency":"","paid":false,"link":""}
+ {"type":"transfer","status":"confirmed","provider":"","confirmation":"","from":"","to":"","date":"YYYY-MM-DD","time":"HH:MM","mode":"booked|shuttle|public|taxi|app|other","meetingPoint":"","contact":"driver or company phone/WeChat","vehicle":"","totalPrice":null,"currency":"","paid":false,"link":""},
+ {"type":"overland","status":"confirmed","provider":"","confirmation":"","mode":"train|bus|ferry|car|other","from":"","to":"","date":"YYYY-MM-DD","time":"HH:MM departure or pick-up","arriveTime":"HH:MM","endDate":"YYYY-MM-DD drop-off date, car rentals only","operator":"rail/bus/ferry company or rental company","number":"train or bus number, or car class","seat":"class, seat or extras","passengers":["full names"],"pricePerPerson":null,"totalPrice":null,"currency":"","paid":false,"link":""}
 ],"ignored":""}`;
 }
 
@@ -1918,6 +2382,36 @@ function buildProposals(res, trip, state) {
       return;
     }
 
+    if (b.type === "overland" || (b.type === "transfer" && ["train", "bus", "ferry", "car", "rental"].includes(b.mode))) {
+      const date = cleanDate(b.date);
+      const kind = b.mode === "rental" ? "car" : OVERLAND_KINDS[b.mode] ? b.mode : "other";
+      const matched = matchPeople(b.passengers || []);
+      const who = matched.length ? matched : trip.travelerIds;
+      const perPerson = hasText(b.pricePerPerson) && !hasText(b.totalPrice);
+      const pr = priceIn(perPerson ? b.pricePerPerson : b.totalPrice, b.currency);
+      const notes = [
+        b.paid === true ? "Paid" : b.paid === false ? "Not paid yet" : "", pr.note, via, status === "pending" && "Not confirmed yet",
+      ].filter(Boolean).join(". ");
+      const obj = normOverland({
+        kind, from: b.from || "", to: b.to || "", date, time: b.time || "", arrive: b.arriveTime || "", endDate: cleanDate(b.endDate),
+        operator: b.operator || b.provider || "", number: (b.number || "").toString(), seat: b.seat || "",
+        price: pr.value, currency: pr.currency, per: perPerson ? "person" : "total", travelerIds: who,
+        booked, confirmation: (b.confirmation || "").toString().trim(), link: b.link || "", notes, source: "email",
+      });
+      const num = upper(obj.number).replace(/\s+/g, "");
+      const matches = overlandOf(trip).filter((x) =>
+        x.date === date && ((num && upper(x.number).replace(/\s+/g, "") === num) || similarName(x.from, b.from) || similarName(x.to, b.to)));
+      out.push({
+        key: `o${bi}`, kind: "overland", status, obj, include: status !== "cancelled" || matches.length > 0,
+        target: matches[0]?.id || "new",
+        matches: matches.map((x) => ({ id: x.id, label: `${OVERLAND_KINDS[x.kind][0]} ${x.from || "?"} → ${x.to || "?"} (${shortDate(x.date)})` })),
+        title: `${OVERLAND_KINDS[kind][0]}: ${b.from || "?"} → ${b.to || "?"}`,
+        sub: [shortDate(date), b.time, obj.number, pr.value !== null ? money(overlandUSD(obj, state.settings), state.settings) : null, obj.confirmation].filter(Boolean).join(" · "),
+        warnings: [!nearTrip(trip, date) && "Outside this trip's dates", pr.note && "Currency not converted", status === "pending" && "Not confirmed yet", status === "cancelled" && "Cancelled"].filter(Boolean),
+      });
+      return;
+    }
+
     if (b.type === "transfer") {
       const date = cleanDate(b.date);
       const d = destFor(trip, date, date ? addDays(date, 1) : "", b.from, b.to);
@@ -2002,6 +2496,20 @@ function applyProposal(t, p) {
     return;
   }
 
+  if (p.kind === "overland") {
+    t.overland = overlandOf(t);
+    let x = p.target !== "new" && t.overland.find((y) => y.id === p.target);
+    if (p.status === "cancelled") { if (x) { x.booked = false; x.notes = addNote(x.notes, "Cancelled per booking email"); } return; }
+    if (x) {
+      merge(x, ["kind", "from", "to", "date", "time", "arrive", "endDate", "operator", "number", "seat", "price", "currency", "per", "travelerIds", "link", "confirmation"]);
+      x.notes = addNote(x.notes, o.notes);
+      x.booked = o.booked;
+    } else {
+      t.overland.push(clone(o));
+    }
+    return;
+  }
+
   if (p.kind === "transfer") {
     t.transfers = transfersOf(t);
     let x = p.target !== "new" && t.transfers.find((y) => y.id === p.target);
@@ -2020,7 +2528,7 @@ function applyProposal(t, p) {
   }
 }
 
-const KIND_ICON = { flight: Plane, hotel: BedDouble, transfer: CarFront, note: Info };
+const KIND_ICON = { flight: Plane, hotel: BedDouble, transfer: CarFront, overland: TrainFront, note: Info };
 
 function ImportPanel({ trip, state, updTrip, onClose, onDone }) {
   const [pasted, setPasted] = useState("");
@@ -2056,7 +2564,7 @@ function ImportPanel({ trip, state, updTrip, onClose, onDone }) {
         maxTokens: 4000,
       });
       const props = buildProposals(res, trip, state);
-      if (!props.length) throw new Error(res?.ignored ? `No flights, hotels or transfers found. The email mentions: ${res.ignored}` : "No flights, hotels or transfers found in this email");
+      if (!props.length) throw new Error(res?.ignored ? `No flights, hotels, transfers or trains found. The email mentions: ${res.ignored}` : "No flights, hotels, transfers or trains found in this email");
       setReview({ props, warnings: inp.warnings, ignored: res?.ignored || "" });
     } catch (e) {
       setErr(e.message || String(e));
@@ -2080,7 +2588,7 @@ function ImportPanel({ trip, state, updTrip, onClose, onDone }) {
         <div>
           <h2 className="display text-xl font-bold">Import a booking</h2>
           <p className="text-sm muted">
-            Paste a confirmation email, or add the .eml, PDF voucher or a screenshot. Flights, hotels and transfers are read out and matched to what you've already logged; nothing is saved until you confirm.
+            Paste a confirmation email, or add the .eml, PDF voucher or a screenshot. Flights, hotels, transfers, trains, buses and rental cars are read out and matched to what you've already logged; nothing is saved until you confirm.
           </p>
         </div>
         <button className="btn btn-quiet" aria-label="Close import" onClick={onClose}><X size={16} /></button>
@@ -2177,6 +2685,162 @@ const tripDateList = (trip) => {
   return Array.from({ length: n }, (_, i) => addDays(trip.start, i));
 };
 
+/* Pasted day-by-day plans. Without AI, headings like "Day 2", "3 Oct",
+   "Oct 3" or "Saturday" start a new day. */
+const WEEKDAYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+const WD_WORD = "(?:sunday|monday|tuesday|wednesday|thursday|friday|saturday|sun|mon|tue|tues|wed|thu|thur|thurs|fri|sat)";
+const MO_WORD = "(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sept|sep|oct|nov|dec)";
+const RE_DAYMONTH = new RegExp(`^(?:${WD_WORD}\\.?,?\\s+)?(\\d{1,2})(?:st|nd|rd|th)?\\s+${MO_WORD}\\.?(?![a-z])[\\s:.\\-–—,]*(.*)$`, "i");
+const RE_MONTHDAY = new RegExp(`^(?:${WD_WORD}\\.?,?\\s+)?${MO_WORD}\\.?\\s+(\\d{1,2})(?:st|nd|rd|th)?(?!\\d)[\\s:.\\-–—,]*(.*)$`, "i");
+const RE_WEEKDAY = new RegExp(`^(${WD_WORD})\\.?(?![a-z])[\\s:.\\-–—,]*(.*)$`, "i");
+function planHeading(line, dates, lastIdx) {
+  const l = line.trim();
+  if (l.length > 80) return null;
+  let m, idx = -1;
+  const mon = (w) => MONTHS.indexOf(w.slice(0, 3).toLowerCase());
+  const byMD = (mo, d) => dates.findIndex((x) => Number(x.slice(5, 7)) === mo + 1 && Number(x.slice(8, 10)) === d);
+  if ((m = l.match(/^(?:day|dia|día|jour|d)\s*(\d{1,2})\b[\s:.\-–—)]*(.*)$/i) || l.match(/^第\s*(\d{1,2})\s*天[\s:：\-–—]*(.*)$/))) idx = Number(m[1]) - 1;
+  else if ((m = l.match(RE_DAYMONTH))) { idx = byMD(mon(m[2]), Number(m[1])); m = [m[0], m[1], m[3]]; }
+  else if ((m = l.match(RE_MONTHDAY))) { idx = byMD(mon(m[1]), Number(m[2])); m = [m[0], m[2], m[3]]; }
+  else if ((m = l.match(RE_WEEKDAY))) {
+    const wd = WEEKDAYS.indexOf(m[1].slice(0, 3).toLowerCase());
+    idx = dates.findIndex((x, i) => i > lastIdx && new Date(parseD(x)).getUTCDay() === wd);
+  } else return null;
+  if (idx < 0 || idx >= dates.length) return { idx: -1, rest: "" };
+  return { idx, rest: (m[2] || "").trim() };
+}
+function parsePlanText(text, dates) {
+  const blocks = {};
+  const loose = [];
+  let cur = -1;
+  text.split("\n").forEach((raw) => {
+    const line = raw.replace(/\s+$/, "");
+    const h = line.trim() ? planHeading(line.replace(/^[#*\s]+|\*+$/g, ""), dates, cur) : null;
+    if (h) {
+      cur = h.idx;
+      if (cur >= 0 && h.rest) (blocks[cur] = blocks[cur] || []).push(h.rest);
+      if (cur < 0) loose.push(line.trim());
+      return;
+    }
+    if (!line.trim()) return;
+    if (cur >= 0) (blocks[cur] = blocks[cur] || []).push(line.trim());
+    else loose.push(line.trim());
+  });
+  return {
+    days: Object.entries(blocks).map(([i, lines]) => ({ date: dates[i], text: lines.join("\n") })),
+    unplaced: loose.join("\n"),
+  };
+}
+
+function PastePlan({ trip, dates, updTrip }) {
+  const [text, setText] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const [preview, setPreview] = useState(null);
+  const [mode, setMode] = useState("append");
+  const [msg, setMsg] = useState("");
+  const useAI = aiReady();
+
+  const read = async () => {
+    setErr(""); setMsg("");
+    setBusy(true);
+    let res;
+    try {
+      if (useAI) {
+        const r = await askAI({
+          system: "You sort a traveller's own day-by-day plan into dates. Keep their wording; never invent, summarise or translate.",
+          text: `Trip: ${trip.name}. Trip brief: ${trip.notes || "none"}.
+Trip days:
+${dates.map((d, i) => `Day ${i + 1} = ${d} (${fmtDow(d)} ${fmtDate(d)})`).join("\n")}
+
+The plan below is already separated by day, with headings such as "Day 2", a date or a weekday. Put each day's text on its date.
+Keep the traveller's lines as they are (one per line, bullets removed). Drop the heading itself unless it carries information, like "Day 1 – Asakusa".
+Text before the first heading, or for a day outside the trip, goes in "unplaced".
+${JSON_ONLY}
+Format: {"days":[{"date":"YYYY-MM-DD","text":"line 1\\nline 2"}],"unplaced":""}
+
+=== PLAN ===
+${text}`,
+          maxTokens: 4000,
+        });
+        if (!Array.isArray(r?.days)) throw new Error("Unexpected format");
+        res = { days: r.days.filter((x) => dates.includes(x.date) && x.text), unplaced: r.unplaced || "" };
+      } else {
+        res = parsePlanText(text, dates);
+      }
+    } catch (e) {
+      setErr(`The AI couldn't read it (${e.message}). Split it by its headings instead; check the dates.`);
+      res = parsePlanText(text, dates);
+    }
+    setBusy(false);
+    const merged = {};
+    res.days.forEach((x) => { merged[x.date] = merged[x.date] ? `${merged[x.date]}\n${x.text}` : String(x.text).trim(); });
+    const days = Object.entries(merged).sort(([a], [b]) => a.localeCompare(b)).map(([date, t]) => ({ date, text: t, include: true, existing: trip.days[date]?.notes || "" }));
+    if (!days.length) { setErr((e) => e || "Couldn't find any days in that text. Start each day with a heading like \"Day 1\", \"3 Oct\" or \"Saturday\"."); return; }
+    setPreview({ days, unplaced: res.unplaced });
+  };
+
+  const chosen = (preview?.days || []).filter((x) => x.include);
+  const apply = () => {
+    updTrip((t) => {
+      chosen.forEach((x) => {
+        const cur = t.days[x.date]?.notes || "";
+        const next = mode === "replace" || !cur.trim() ? x.text : cur.includes(x.text) ? cur : `${cur.replace(/\s+$/, "")}\n${x.text}`;
+        t.days[x.date] = { ...(t.days[x.date] || {}), notes: next };
+      });
+    });
+    setMsg(`Added plans to ${plural(chosen.length, "day")}.`);
+    setPreview(null);
+    setText("");
+  };
+
+  return (
+    <section className="panel p-4">
+      <h2 className="font-semibold mb-1 flex items-center gap-2"><ClipboardPaste size={16} aria-hidden="true" /> Paste your plan</h2>
+      <p className="text-sm muted mb-2">
+        From your notes app, separated by day ("Day 1", "3 Oct", "Saturday"…). {useAI ? "The AI puts each day's lines on the right date" : "Each heading starts a new day"}; you check it before anything is added.
+      </p>
+      {!preview && (
+        <>
+          <textarea rows={5} value={text} onChange={(e) => setText(e.target.value)} aria-label="Your day-by-day plan"
+            placeholder={"Day 1 – Asakusa\nSenso-ji early, then Kakimori\nDinner: Sometaro\n\nDay 2\nImperial Palace East Garden…"} />
+          <div className="mt-2">
+            {useAI ? <AIButton busy={busy} onClick={read}>Read plan</AIButton> : <button className="btn btn-solid" disabled={!text.trim()} onClick={read}><ClipboardPaste size={14} /> Read plan</button>}
+          </div>
+        </>
+      )}
+      <ErrorLine msg={err} />
+      {preview && (
+        <div className="mt-2 space-y-2">
+          <p className="font-semibold">{plural(preview.days.length, "day")} found.</p>
+          <ul className="space-y-2">
+            {preview.days.map((x) => (
+              <li key={x.date} className="grid gap-2" style={{ gridTemplateColumns: "auto 92px minmax(0,1fr)" }}>
+                <input type="checkbox" aria-label={`Include ${fmtDate(x.date)}`} checked={x.include} onChange={(e) => setPreview((pv) => ({ ...pv, days: pv.days.map((y) => (y.date === x.date ? { ...y, include: e.target.checked } : y)) }))} />
+                <div><div className="font-semibold">{fmtDate(x.date)}</div><div className="text-xs muted">{fmtDow(x.date)}, day {dates.indexOf(x.date) + 1}</div></div>
+                <div className="min-w-0">
+                  <p className="text-sm whitespace-pre-line">{x.text}</p>
+                  {x.existing && <p className="text-xs muted mt-1">Already written for this day: {x.existing.length > 80 ? `${x.existing.slice(0, 80)}…` : x.existing}</p>}
+                </div>
+              </li>
+            ))}
+          </ul>
+          {preview.unplaced?.trim() && <p className="text-sm muted whitespace-pre-line">Not tied to a day, left out: {preview.unplaced.trim()}</p>}
+          <div className="flex flex-wrap items-center gap-3">
+            <label className="flex items-center gap-1 text-sm"><input type="radio" name="planmode" checked={mode === "append"} onChange={() => setMode("append")} style={{ width: "auto" }} /> Add below what's there</label>
+            <label className="flex items-center gap-1 text-sm"><input type="radio" name="planmode" checked={mode === "replace"} onChange={() => setMode("replace")} style={{ width: "auto" }} /> Replace those days</label>
+          </div>
+          <div className="flex gap-2">
+            <button className="btn btn-solid" disabled={!chosen.length} onClick={apply}><Check size={14} /> Add to {plural(chosen.length, "day")}</button>
+            <button className="btn btn-quiet" onClick={() => setPreview(null)}>Back</button>
+          </div>
+        </div>
+      )}
+      {msg && <p className="text-sm mt-2" role="status">{msg}</p>}
+    </section>
+  );
+}
+
 function ItineraryTab({ trip, state, updTrip, onOpenMap }) {
   const [busy, setBusy] = useState(null);
   const [err, setErr] = useState("");
@@ -2195,7 +2859,7 @@ function ItineraryTab({ trip, state, updTrip, onOpenMap }) {
       const n = nightsBetween(d.start, d.end) + 1;
       const prompt = `Draft a day-by-day plan for ${d.name}, ${d.start} to ${d.end} (${n} days including travel days).
 Travelers: ${people.map((p) => `${p.name} (${p.notes || "no notes"})`).join("; ")}.
-Trip notes: ${trip.notes || "none"}.
+Trip brief: ${trip.notes || "none"}.
 Keep pacing realistic, group nearby places on the same day, and keep arrival and departure days light.
 ${JSON_ONLY}
 Format: [{"d":"YYYY-MM-DD","plan":"one line under 25 words"}] with one entry per date.`;
@@ -2228,6 +2892,8 @@ Format: [{"d":"YYYY-MM-DD","plan":"one line under 25 words"}] with one entry per
         <ErrorLine msg={err} />
       </section>
 
+      {dates.length > 0 && <PastePlan trip={trip} dates={dates} updTrip={updTrip} />}
+
       {!dates.length && <Empty>Set trip dates in Overview to see the day list.</Empty>}
 
       <ol className="space-y-2">
@@ -2245,7 +2911,7 @@ Format: [{"d":"YYYY-MM-DD","plan":"one line under 25 words"}] with one entry per
               <div className="space-y-2 min-w-0">
                 <textarea
                   aria-label={`Plan for ${fmtDate(date)}`}
-                  rows={2}
+                  rows={Math.min(10, Math.max(2, (trip.days[date]?.notes || "").split("\n").length))}
                   value={trip.days[date]?.notes || ""}
                   placeholder="Plans, bookings, reservations"
                   onChange={(e) => updTrip((t) => { t.days[date] = { ...(t.days[date] || {}), notes: e.target.value }; })}
@@ -2464,6 +3130,180 @@ const TROPICAL_RE = /bali|lombok|thai|phuket|krabi|samui|boracay|palawan|siargao
 const normText = (s) => (s || "").toLowerCase().trim();
 const STANDARD_TEXTS = new Set(STANDARD_CARRY.map((x) => normText(x[2])));
 
+/* Pasted packing lists: read with AI when set up, otherwise split lines and
+   guess categories from keywords. */
+const PACK_GUESS = [
+  ["Documents", /passport|visa|ticket|boarding|insurance|\bid\b|licen[cs]e|itinerary|cash|credit card|debit card|wallet|money|yuan|dollars|reais|card holder|vaccin/i],
+  ["Tech", /charg|cable|adapt|power ?bank|phone|laptop|macbook|ipad|tablet|kindle|headphone|earbud|airpods|camera|usb|plug|sim\b|esim|watch|mouse|hdmi|batter/i],
+  ["Shoes", /shoe|sneaker|trainer|sandal|flip.?flop|boot|slipper|loafer|havaianas/i],
+  ["Toiletries", /tooth|paste|brush|shampoo|conditioner|soap|deodorant|razor|shav|sunscreen|sun ?cream|spf|lotion|perfume|cologne|skincare|moistur|floss|comb|hair|medic|pill|ibuprofen|paracetamol|contact|lens|glasses|insect|repellent|tissue|wipes|sanit|lip ?balm|nail/i],
+  ["Clothing", /shirt|tee\b|t-shirt|polo|pants|trouser|shorts|jeans|chino|sock|underwear|boxer|brief|bra\b|dress|skirt|jacket|coat|hoodie|sweater|jumper|cardigan|swim|bikini|trunk|pajama|pyjama|hat\b|cap\b|belt|scarf|blazer|suit\b|linen|outfit|clothes|top\b|legging/i],
+];
+const guessCat = (t) => PACK_GUESS.find(([, re]) => re.test(t))?.[0] || "Other";
+const tidyItem = (t) => t.replace(/^[\s\-–—*•·◦▪●○✓✔☐☑□■>]+/, "").replace(/^\d{1,2}[.)]\s+/, "").replace(/\s+/g, " ").trim();
+
+function parsePackingText(text) {
+  const out = [];
+  let heading = null;
+  text.split(/\n|;/).forEach((raw) => {
+    const line = tidyItem(raw);
+    if (!line) { heading = null; return; } // a blank line ends a heading's section
+    if (/:$/.test(line) && line.length < 40) { const c = guessHeading(line); heading = c; return; }
+    const parts = line.includes(",") && !/\d,\d/.test(line) ? line.split(",") : [line];
+    parts.forEach((p0) => {
+      let t = tidyItem(p0), qty = null, m;
+      if (!t) return;
+      if ((m = t.match(/^(\d{1,2})\s*[x×]?\s+(.+)$/i))) { qty = Number(m[1]); t = m[2]; }
+      else if ((m = t.match(/^(.+?)\s*(?:[x×]\s*(\d{1,2})|\((\d{1,2})\))$/i))) { t = m[1]; qty = Number(m[2] || m[3]); }
+      t = t.charAt(0).toUpperCase() + t.slice(1);
+      // The item's own keywords win ("Phone charger" under "Toiletries:" is still Tech); the heading fills the gaps.
+      const own = guessCat(t);
+      const cat = own !== "Other" ? own : heading || "Other";
+      out.push({ text: t, cat, bag: cat === "Documents" || cat === "Tech" ? "Backpack" : "Suitcase", qty });
+    });
+  });
+  return out;
+}
+function guessHeading(line) {
+  const l = line.toLowerCase();
+  if (/doc|paper/.test(l)) return "Documents";
+  if (/tech|electr|gadget/.test(l)) return "Tech";
+  if (/shoe|foot/.test(l)) return "Shoes";
+  if (/toilet|hygien|bath|med|health|beauty/.test(l)) return "Toiletries";
+  if (/cloth|wear|outfit/.test(l)) return "Clothing";
+  return null;
+}
+
+function PastePacking({ trip, state, update, addItems }) {
+  const [text, setText] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const [preview, setPreview] = useState(null);
+  const [saved, setSaved] = useState(null); // items just added, offered as a preset
+  const [presetName, setPresetName] = useState("");
+  const [msg, setMsg] = useState("");
+  const useAI = aiReady();
+
+  const read = async () => {
+    setErr(""); setMsg(""); setSaved(null);
+    let list;
+    setBusy(true);
+    try {
+      if (useAI) {
+        const res = await askAI({
+          system: "You turn a traveller's own packing list into structured items. Keep their items and wording; never add things they didn't list.",
+          text: `Packing list for ${trip.name} (${nightsBetween(trip.start, trip.end)} nights). Trip brief: ${trip.notes || "none"}.
+Split it into one entry per item. Lines like "Toiletries:" are headings: they set the category of the items under them and are not items.
+Quantities like "3x socks", "socks x3" or "3 pairs of socks" become qty 3 and the text "Socks". Drop bullets, checkboxes and numbering.
+cat is one of ${PACK_CATS.join(", ")}. bag is one of ${BAGS.join(", ")}: Documents and Tech go in Backpack, things worn on the plane in "Wear on travel day" when the list says so, everything else in Suitcase unless the list says otherwise.
+${JSON_ONLY}
+Format: [{"text":"Socks","cat":"Clothing","bag":"Suitcase","qty":3}] with qty null when not stated.
+
+=== LIST ===
+${text}`,
+          maxTokens: 3000,
+        });
+        const arr = Array.isArray(res) ? res : Array.isArray(res?.items) ? res.items : null;
+        if (!arr) throw new Error("Unexpected format");
+        list = arr.filter((x) => x && x.text).map((x) => ({
+          text: String(x.text).trim(),
+          cat: PACK_CATS.includes(x.cat) ? x.cat : guessCat(String(x.text)),
+          bag: BAGS.includes(x.bag) ? x.bag : bagFor(x.cat),
+          qty: numOrNull(x.qty),
+        }));
+      } else {
+        list = parsePackingText(text);
+      }
+    } catch (e) {
+      setErr(`The AI couldn't read it (${e.message}). Sorted it with simple rules instead; check the categories.`);
+      list = parsePackingText(text);
+    }
+    setBusy(false);
+    const have = new Set(trip.packing.map((x) => normText(x.text)));
+    const seen = new Set();
+    setPreview(list.map((x, i) => {
+      const k = normText(x.text);
+      const dup = have.has(k) || seen.has(k);
+      seen.add(k);
+      return { ...x, key: i, dup, include: !dup };
+    }));
+  };
+
+  const setRow = (key, patch) => setPreview((pv) => pv.map((x) => (x.key === key ? { ...x, ...patch } : x)));
+  const chosen = (preview || []).filter((x) => x.include);
+  const apply = () => {
+    const items = chosen.map(({ text: t, cat, bag, qty }) => ({ text: t, cat, bag, qty }));
+    const r = addItems(items);
+    setMsg(`Added ${plural(r.added, "item")}${r.skipped ? `, skipped ${r.skipped} already on the list` : ""}.`);
+    setSaved(items);
+    setPresetName(`${trip.name} list`);
+    setPreview(null);
+    setText("");
+  };
+  const savePreset = () => {
+    const name = presetName.trim();
+    if (!name || !saved) return;
+    update((s) => {
+      s.packPresets = s.packPresets || [];
+      s.packPresets.push({ id: "u_" + uid(), name, desc: `Your pasted list, ${plural(saved.length, "item")}`, items: saved });
+    });
+    setMsg(`Saved "${name}" as a preset. It's in Trip type above.`);
+    setSaved(null);
+  };
+
+  return (
+    <section className="panel p-4">
+      <h2 className="display text-xl font-bold mb-1 flex items-center gap-2"><ClipboardPaste size={18} aria-hidden="true" /> Paste your own list</h2>
+      <p className="text-sm muted mb-3">
+        From your notes app or anywhere else, in any format. {useAI ? "The AI sorts each item into a bag and category" : "Each line or comma becomes an item, sorted by keywords (set up AI under This device for smarter sorting)"}; you check it before anything is added.
+      </p>
+      {!preview && (
+        <>
+          <textarea rows={5} value={text} onChange={(e) => setText(e.target.value)} placeholder={"Passport\n3x t-shirts, 2 shorts\nToiletries:\nsunscreen\ntoothbrush"} aria-label="Your packing list" />
+          <div className="flex flex-wrap items-center gap-2 mt-2">
+            {useAI ? <AIButton busy={busy} onClick={read}>Read list</AIButton> : <button className="btn btn-solid" disabled={!text.trim()} onClick={read}><ClipboardPaste size={14} /> Read list</button>}
+          </div>
+        </>
+      )}
+      <ErrorLine msg={err} />
+      {preview && (
+        <div className="mt-2">
+          <p className="font-semibold mb-2">{plural(preview.length, "item")} found. Untick or re-sort anything, then add.</p>
+          <ul className="space-y-1" style={{ maxHeight: 360, overflowY: "auto" }}>
+            {preview.map((x) => (
+              <li key={x.key} className="grid gap-2 items-center" style={{ gridTemplateColumns: "auto minmax(0,1fr) 120px 140px 64px" }}>
+                <input type="checkbox" aria-label={`Include ${x.text}`} checked={x.include} onChange={(e) => setRow(x.key, { include: e.target.checked })} />
+                <span className="min-w-0">
+                  <input aria-label="Item" value={x.text} onChange={(e) => setRow(x.key, { text: e.target.value })} style={{ padding: "3px 6px" }} />
+                  {x.dup && <span className="text-xs muted">Already on your list</span>}
+                </span>
+                <select aria-label="Category" value={x.cat} onChange={(e) => setRow(x.key, { cat: e.target.value })} style={{ padding: "3px 6px" }}>{PACK_CATS.map((c) => <option key={c}>{c}</option>)}</select>
+                <select aria-label="Bag" value={x.bag} onChange={(e) => setRow(x.key, { bag: e.target.value })} style={{ padding: "3px 6px" }}>{BAGS.map((b) => <option key={b}>{b}</option>)}</select>
+                <input aria-label="Quantity" type="number" min={1} value={x.qty ?? ""} placeholder="qty" onChange={(e) => setRow(x.key, { qty: numOrNull(e.target.value) })} style={{ padding: "3px 6px" }} className="num" />
+              </li>
+            ))}
+          </ul>
+          <div className="flex flex-wrap gap-2 mt-3">
+            <button className="btn btn-solid" disabled={!chosen.length} onClick={apply}><Plus size={14} /> Add {plural(chosen.length, "item")}</button>
+            <button className="btn btn-quiet" onClick={() => setPreview(null)}>Back</button>
+          </div>
+        </div>
+      )}
+      {msg && <p className="text-sm mt-3" role="status">{msg}</p>}
+      {saved && saved.length > 0 && (
+        <div className="verdict mt-3">
+          <p className="text-sm font-semibold mb-2">Save this list as a preset, so you can load it on another trip?</p>
+          <div className="flex flex-wrap gap-2">
+            <input value={presetName} onChange={(e) => setPresetName(e.target.value)} aria-label="Preset name" style={{ maxWidth: 260 }} />
+            <button className="btn btn-solid" disabled={!presetName.trim()} onClick={savePreset}>Save preset</button>
+            <button className="btn btn-quiet" onClick={() => setSaved(null)}>No thanks</button>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
 function PackingTab({ trip, state, update, updTrip }) {
   const days = Math.max(1, nightsBetween(trip.start, trip.end));
   const place = `${trip.name} ${trip.destinations.map((d) => d.name).join(" ")}`;
@@ -2544,7 +3384,7 @@ function PackingTab({ trip, state, update, updTrip }) {
       const weather = trip.destinations.map((d) => `${d.name}: ${trip.weather[d.id]?.summary || "no weather fetched"}`).join("\n");
       const plans = Object.entries(trip.days).filter(([, v]) => v.notes).map(([k, v]) => `${k}: ${v.notes}`).slice(0, 20).join("\n");
       const current = items.map((i) => i.text).join("; ");
-      const prompt = `Suggest additions to a packing list for a ${days}-night trip. Destinations and weather:\n${weather}\nPlans:\n${plans || "none yet"}\nNotes: ${trip.notes || "none"}.
+      const prompt = `Suggest additions to a packing list for a ${days}-night trip. Destinations and weather:\n${weather}\nPlans:\n${plans || "none yet"}\nTrip brief: ${trip.notes || "none"}.
 Already packed: ${current || "nothing yet"}.
 Only suggest items missing from that list and specific to this trip. The traveler does not carry umbrellas (Chinese airport security). Max 12 items.
 ${JSON_ONLY}
@@ -2642,6 +3482,8 @@ Format: [{"bag":"Suitcase","cat":"Clothing","text":"Light rain jacket"}] with ba
         {presetMsg && <p className="text-sm mt-3" role="status">{presetMsg}</p>}
       </section>
 
+      <PastePacking trip={trip} state={state} update={update} addItems={addItems} />
+
       <section className="panel p-4 flex flex-wrap items-end gap-2">
         <F label="Item" className="flex-1">
           <input value={text} onChange={(e) => setText(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") addOne(); }} placeholder="Add an item and press Enter" />
@@ -2721,6 +3563,9 @@ Format: [{"bag":"Suitcase","cat":"Clothing","text":"Light rain jacket"}] with ba
 /* ------------------------------------------------------------------ */
 /* Wallet and rules                                                    */
 /* ------------------------------------------------------------------ */
+
+/* global __APP_VERSION__ */
+const APP_VERSION = typeof __APP_VERSION__ === "string" ? __APP_VERSION__ : "dev";
 
 function WalletView({ state, update, device, onSaveDevice, sync, onSyncNow }) {
   const st = state.settings;
@@ -2943,6 +3788,7 @@ function WalletView({ state, update, device, onSaveDevice, sync, onSyncNow }) {
           {importMsg && <span className="text-sm" role="status">{importMsg}</span>}
         </div>
       </section>
+      <p className="text-xs muted text-center">Travel HQ {APP_VERSION}</p>
     </div>
   );
 }
