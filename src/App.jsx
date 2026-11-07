@@ -3,7 +3,7 @@ import {
   Plane, BedDouble, CalendarDays, CloudSun, Luggage, LayoutGrid, Wallet, Plus, Trash2,
   Sparkles, Check, ChevronDown, ChevronRight, AlertTriangle, CheckCircle2, Info, Loader2,
   RefreshCw, ArrowLeftRight, XCircle, ExternalLink, Cloud, CloudOff, Download, Upload, CarFront,
-  Mail, X, Paperclip, Map as MapIcon, TrainFront, Bus, Ship, Car, Route, Receipt, UserPlus, ClipboardPaste,
+  Mail, X, Paperclip, GripVertical, Map as MapIcon, TrainFront, Bus, Ship, Car, Route, Receipt, UserPlus, ClipboardPaste,
 } from "lucide-react";
 import { askAI, aiConfig, aiReady, testAI, AI_PROVIDERS } from "./ai.js";
 import { readInputs } from "./emailinput.js";
@@ -299,7 +299,7 @@ const normHotel = (o = {}) => {
   const h = {
     id: uid(), destId: "", name: "", area: "", nights: null, total: null, currency: "USD",
     channel: "latam", badgeAvios: false, badgeLatam: false, rating: "", notes: "", link: "",
-    checkIn: "", checkOut: "", selected: false, booked: false, confirmation: "", source: "manual", ...o,
+    checkIn: "", checkOut: "", selected: false, booked: false, confirmation: "", source: "manual", destManual: false, ...o,
   };
   h.id = o.id || uid();
   h.total = numOrNull(h.total);
@@ -745,6 +745,16 @@ font-family:'Instrument Sans',ui-sans-serif,system-ui,sans-serif;color:var(--ink
 .thq .seg{border-radius:8px;padding:10px 12px;min-width:120px;color:#fff;background:var(--ink2)}
 .thq .seg.empty{background:transparent;color:var(--ink);border:1.5px dashed var(--ink2)}
 .thq .picked{box-shadow:inset 4px 0 0 var(--gold)}
+.thq .drag-handle{display:flex;align-items:center;justify-content:center;width:28px;height:40px;margin:-4px -6px -4px -4px;color:var(--muted,#8a8a8a);cursor:grab;touch-action:none;border-radius:6px}
+.thq .drag-handle:hover{background:rgba(0,0,0,.04)}
+.thq .drop-zone{border-radius:12px;transition:box-shadow .12s,background .12s}
+.thq .drop-zone.over{box-shadow:0 0 0 3px var(--gold);background:rgba(200,160,60,.06)}
+.thq .drag-ghost{position:fixed;z-index:60;pointer-events:none;transform:translate(12px,-50%);display:flex;gap:6px;align-items:center;background:#fff;border:1px solid var(--line);border-radius:999px;padding:6px 12px;font-size:13px;font-weight:600;box-shadow:0 6px 20px rgba(0,0,0,.15);white-space:nowrap}
+.thq .drop-bar{position:fixed;z-index:50;left:0;right:0;bottom:0;display:flex;gap:8px;align-items:center;overflow-x:auto;padding:12px 16px calc(12px + env(safe-area-inset-bottom));background:rgba(255,255,255,.97);border-top:1px solid var(--line);box-shadow:0 -6px 20px rgba(0,0,0,.08)}
+.thq .drop-chip{flex-shrink:0;padding:10px 16px;border:1.5px dashed var(--line);border-radius:999px;font-weight:600;font-size:14px;white-space:nowrap}
+.thq .drop-chip.here{opacity:.45}
+.thq .drop-chip.over{border-style:solid;border-color:var(--gold);background:var(--gold);color:#fff}
+body.thq-dragging{user-select:none;-webkit-user-select:none;cursor:grabbing}
 .thq .verdict{background:var(--goldsoft);border-radius:8px;padding:10px 12px}
 .thq table{border-collapse:collapse;width:100%}
 .thq th{font-size:12px;font-weight:500;color:var(--muted);text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}
@@ -1298,7 +1308,8 @@ function TripDetails({ trip, state, update, updTrip }) {
                 disabled={trip.destinations.length === 1}
                 onClick={() => updTrip((t) => {
                   t.destinations.splice(i, 1);
-                  t.hotels = t.hotels.filter((h) => h.destId !== d.id);
+                  // Its stays wait under "Not in a city yet" on Hotels rather than being deleted.
+                  t.hotels.forEach((h) => { if (h.destId === d.id) { h.destId = ""; h.destManual = false; } });
                   delete t.weather[d.id];
                 })}
               ><Trash2 size={14} /></button>
@@ -1598,7 +1609,7 @@ function FlightCard({ f, st, people, isPick, open, setOpen, updTrip }) {
         <button className="btn btn-quiet" aria-expanded={open} aria-label="Edit details" onClick={() => setOpen(!open)}>
           {open ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
         </button>
-        <div className="min-w-0 flex-1">
+        <div className="min-w-0 flex-1 basis-48">
           <div className="font-semibold">
             {f.route || "Route"} <span className="muted font-normal">{f.flightNo}</span>
             {isPick && <span className="chip chip-warn ml-2">Rules pick</span>}
@@ -1614,7 +1625,7 @@ function FlightCard({ f, st, people, isPick, open, setOpen, updTrip }) {
             {checks.map((c, i) => <Chip key={i} s={c.s}>{c.t}</Chip>)}
           </div>
         </div>
-        <div className="text-right num">
+        <div className="text-right num shrink-0 ml-auto">
           <div className="font-bold">{money(pp !== null ? pp * pax : null, st)}</div>
           <div className="text-xs muted">{money(pp, st)} pp, {pax} pax</div>
           {earnValue !== null && <div className="text-xs" style={{ color: "var(--ok)" }}>≈ {money(earnValue, st)} back in miles</div>}
@@ -1688,18 +1699,145 @@ function FlightCard({ f, st, people, isPick, open, setOpen, updTrip }) {
 
 /* ---------------- Hotels ---------------- */
 
+// Puts a stay in a city. Marked as your choice, so the app stops suggesting
+// a different one.
+function moveHotel(t, id, destId) {
+  const x = t.hotels.find((h) => h.id === id);
+  if (!x) return;
+  x.destId = destId;
+  x.destManual = true;
+}
+
+// The city a stay seems to belong in, when that isn't the one it's filed
+// under: the city named in its area, otherwise the city whose dates it falls in.
+function suggestedDest(trip, h) {
+  if (h.destManual) return null;
+  const ds = trip.destinations;
+  const to = destByName(ds, h.area) || (validD(h.checkIn) ? destByDates(ds, h.checkIn, validD(h.checkOut) ? h.checkOut : addDays(h.checkIn, 1)) : null);
+  return to && to.id !== h.destId ? to : null;
+}
+
+const DROP_BAR_H = 76;
+
 function HotelsTab({ trip, state, updTrip }) {
+  const ds = trip.destinations;
+  const orphans = trip.hotels.filter((h) => !ds.some((d) => d.id === h.destId));
+  const moves = trip.hotels.map((h) => ({ h, to: suggestedDest(trip, h) })).filter((m) => m.to);
+
+  // Drag a stay by its handle onto a city: works with mouse, touch and pen.
+  const [drag, setDrag] = useState(null);
+  const dragRef = useRef(null);
+  const grab = (e, h) => {
+    if (e.pointerType === "mouse" && e.button !== 0) return;
+    e.preventDefault();
+    const s = { id: h.id, name: h.name || "Unnamed hotel", from: h.destId, x: e.clientX, y: e.clientY, over: null };
+    dragRef.current = s;
+    setDrag(s);
+  };
+  const dragging = !!drag;
+  useEffect(() => {
+    if (!dragging) return;
+    const targetAt = (x, y) => document.elementFromPoint(x, y)?.closest("[data-drop-dest]")?.getAttribute("data-drop-dest") || null;
+    const refresh = () => { const c = dragRef.current; if (!c) return; c.over = targetAt(c.x, c.y); setDrag({ ...c }); };
+    const move = (e) => { const c = dragRef.current; if (!c) return; c.x = e.clientX; c.y = e.clientY; refresh(); };
+    const end = (drop) => () => {
+      const c = dragRef.current;
+      dragRef.current = null;
+      setDrag(null);
+      if (drop && c?.over && c.over !== c.from) updTrip((t) => moveHotel(t, c.id, c.over));
+    };
+    const up = end(true), cancel = end(false);
+    const key = (e) => { if (e.key === "Escape") cancel(); };
+    // Scroll the page when the finger nears the top, or just above the city bar.
+    let raf;
+    const tick = () => {
+      const c = dragRef.current;
+      if (c) {
+        const bottom = window.innerHeight - DROP_BAR_H;
+        const dy = c.y < 70 ? -14 : c.y > bottom - 70 && c.y < bottom ? 14 : 0;
+        if (dy) { window.scrollBy(0, dy); refresh(); }
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    document.body.classList.add("thq-dragging");
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", cancel);
+    window.addEventListener("keydown", key);
+    return () => {
+      cancelAnimationFrame(raf);
+      document.body.classList.remove("thq-dragging");
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      window.removeEventListener("pointercancel", cancel);
+      window.removeEventListener("keydown", key);
+    };
+  }, [dragging, updTrip]);
+
+  const dnd = { grab, drag };
   return (
-    <div className="space-y-8">
-      {trip.destinations.map((d) => <HotelDest key={d.id} d={d} trip={trip} state={state} updTrip={updTrip} />)}
+    <div className="space-y-8" style={dragging ? { paddingBottom: DROP_BAR_H + 16 } : undefined}>
+      {moves.length > 0 && (
+        <div className="verdict text-sm">
+          <div className="font-semibold mb-1">{plural(moves.length, "stay")} {moves.length === 1 ? "looks" : "look"} like {moves.length === 1 ? "it belongs" : "they belong"} in another city</div>
+          <ul className="mb-2">
+            {moves.map(({ h, to }) => (
+              <li key={h.id}>{h.name || "Unnamed hotel"}{validD(h.checkIn) ? ` (${fmtDate(h.checkIn)})` : ""}: {ds.find((d) => d.id === h.destId)?.name || "no city"} → <strong>{to.name}</strong></li>
+            ))}
+          </ul>
+          <div className="flex flex-wrap gap-2">
+            <button className="btn btn-solid" onClick={() => updTrip((t) => moves.forEach(({ h, to }) => moveHotel(t, h.id, to.id)))}>
+              <Check size={14} /> Move {moves.length === 1 ? "it" : "them"}
+            </button>
+            <button className="btn btn-quiet" onClick={() => updTrip((t) => moves.forEach(({ h }) => { const x = t.hotels.find((y) => y.id === h.id); if (x) x.destManual = true; }))}>
+              Leave as is
+            </button>
+          </div>
+        </div>
+      )}
+      {ds.length > 1 && trip.hotels.length > 0 && !moves.length && (
+        <p className="text-sm muted">Drag a stay by its <GripVertical size={13} className="inline -mt-0.5" /> handle onto another city to move it there.</p>
+      )}
+      {orphans.length > 0 && <HotelDest d={null} list={orphans} trip={trip} state={state} updTrip={updTrip} dnd={dnd} />}
+      {ds.map((d) => <HotelDest key={d.id} d={d} trip={trip} state={state} updTrip={updTrip} dnd={dnd} />)}
+      {drag && (
+        <>
+          <div className="drag-ghost" style={{ left: drag.x, top: drag.y }}><BedDouble size={14} /> {drag.name}</div>
+          <div className="drop-bar" style={{ height: DROP_BAR_H }}>
+            <span className="text-xs muted shrink-0">Move to</span>
+            {ds.map((d) => (
+              <span key={d.id} data-drop-dest={d.id} className={`drop-chip ${drag.over === d.id ? "over" : ""} ${drag.from === d.id ? "here" : ""}`}>
+                {d.name}
+              </span>
+            ))}
+          </div>
+        </>
+      )}
     </div>
   );
 }
 
-function HotelDest({ d, trip, state, updTrip }) {
+function HotelDest({ d, list: given, trip, state, updTrip, dnd }) {
   const st = state.settings;
   const [open, setOpen] = useState(null);
-  const nights = nightsBetween(d.start, d.end);
+  const nights = d ? nightsBetween(d.start, d.end) : 0;
+  const over = d && dnd.drag?.over === d.id && dnd.drag.from !== d.id;
+  if (!d) {
+    return (
+      <section>
+        <div className="mb-3">
+          <h2 className="display text-2xl font-bold">Not in a city yet</h2>
+          <p className="muted">These stays aren't counted in costs or nights until they're in a city. Drag each one onto a city, or open it and pick one.</p>
+        </div>
+        <div className="space-y-2">
+          {given.map((h) => (
+            <HotelCard key={h.id} h={h} d={null} dests={trip.destinations} st={st} nights={0} open={open === h.id} setOpen={(o) => setOpen(o ? h.id : null)} updTrip={updTrip} dnd={dnd} />
+          ))}
+        </div>
+      </section>
+    );
+  }
   const list = trip.hotels
     .filter((h) => h.destId === d.id)
     .sort((a, b) => (hotelRange(a, d)[0] || "").localeCompare(hotelRange(b, d)[0] || "") || (a.name || "").localeCompare(b.name || ""));
@@ -1723,7 +1861,7 @@ function HotelDest({ d, trip, state, updTrip }) {
   const best = priced.length > 1 ? priced.reduce((a, b) => (perNightEff(b) < perNightEff(a) ? b : a)) : null;
 
   return (
-    <section>
+    <section data-drop-dest={d.id} className={`drop-zone ${over ? "over" : ""}`}>
       <div className="flex flex-wrap items-end justify-between gap-3 mb-3">
         <div>
           <h2 className="display text-2xl font-bold">{d.name}</h2>
@@ -1732,7 +1870,7 @@ function HotelDest({ d, trip, state, updTrip }) {
         <button className="btn btn-solid" onClick={add}><Plus size={14} /> Log hotel</button>
       </div>
       {!list.length ? (
-        <Empty>No hotels logged for {d.name} yet. Add the ones you're considering to compare price per night and miles.</Empty>
+        <Empty>{dnd.drag ? `Drop here to move it to ${d.name}.` : `No hotels logged for ${d.name} yet. Add the ones you're considering to compare price per night and miles.`}</Empty>
       ) : (
         <div className="space-y-2">
           {picked.length > 0 && (
@@ -1748,7 +1886,7 @@ function HotelDest({ d, trip, state, updTrip }) {
             </div>
           )}
           {list.map((h) => (
-            <HotelCard key={h.id} h={h} d={d} st={st} nights={nights} isBest={best?.id === h.id} open={open === h.id} setOpen={(o) => setOpen(o ? h.id : null)} updTrip={updTrip} />
+            <HotelCard key={h.id} h={h} d={d} dests={trip.destinations} st={st} nights={nights} isBest={best?.id === h.id} open={open === h.id} setOpen={(o) => setOpen(o ? h.id : null)} updTrip={updTrip} dnd={dnd} />
           ))}
         </div>
       )}
@@ -1774,7 +1912,7 @@ function milesFor(h, totalUSD, st) {
   return { latam, avios, value, label };
 }
 
-function HotelCard({ h, d, st, nights, isBest, open, setOpen, updTrip }) {
+function HotelCard({ h, d, dests, st, nights, isBest, open, setOpen, updTrip, dnd }) {
   const set = (k, v) => updTrip((t) => { const x = t.hotels.find((y) => y.id === h.id); if (x) x[k] = v; });
   const n = hotelNights(h, d);
   const ownDates = validD(h.checkIn) && validD(h.checkOut);
@@ -1788,12 +1926,17 @@ function HotelCard({ h, d, st, nights, isBest, open, setOpen, updTrip }) {
   const toggleSelect = () => updTrip((t) => pickHotel(t, h.id, !h.selected));
 
   return (
-    <div className={`panel ${h.selected ? "picked" : ""}`}>
+    <div className={`panel ${h.selected ? "picked" : ""}`} style={dnd?.drag?.id === h.id ? { opacity: 0.4 } : undefined}>
       <div className="flex flex-wrap items-center gap-3 p-3">
+        {dests.length > 1 && (
+          <span className="drag-handle" role="img" aria-label="Drag to another city" title="Drag to another city" onPointerDown={(e) => dnd.grab(e, h)}>
+            <GripVertical size={18} />
+          </span>
+        )}
         <button className="btn btn-quiet" aria-expanded={open} aria-label="Edit details" onClick={() => setOpen(!open)}>
           {open ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
         </button>
-        <div className="min-w-0 flex-1">
+        <div className="min-w-0 flex-1 basis-48">
           <div className="font-semibold">
             {h.name || "Unnamed hotel"} {h.area && <span className="muted font-normal">{h.area}</span>}
             {h.rating && <span className="muted font-normal"> ({h.rating})</span>}
@@ -1812,7 +1955,7 @@ function HotelCard({ h, d, st, nights, isBest, open, setOpen, updTrip }) {
           </div>
           {!open && h.notes && <p className="text-sm muted mt-1">{h.notes}</p>}
         </div>
-        <div className="text-right num">
+        <div className="text-right num shrink-0 ml-auto">
           <div className="font-bold">{tot === null ? "Add price" : money(tot, st)}</div>
           <div className="text-xs muted">{tot === null ? `${n} nights` : `${money(tot / (n || 1), st)}/night, ${n} nights`}</div>
           {m.value > 0 && <div className="text-xs" style={{ color: "var(--ok)" }}>≈ {money(tot - m.value, st)} after miles</div>}
@@ -1824,6 +1967,12 @@ function HotelCard({ h, d, st, nights, isBest, open, setOpen, updTrip }) {
       {open && (
         <div className="p-3 pt-0 grid gap-3 sm:grid-cols-3 lg:grid-cols-6">
           <F label="Name" className="sm:col-span-2"><input value={h.name} onChange={(e) => set("name", e.target.value)} /></F>
+          <F label="City">
+            <select value={dests.some((x) => x.id === h.destId) ? h.destId : ""} onChange={(e) => e.target.value && updTrip((t) => moveHotel(t, h.id, e.target.value))}>
+              {!dests.some((x) => x.id === h.destId) && <option value="">Pick a city</option>}
+              {dests.map((x) => <option key={x.id} value={x.id}>{x.name}</option>)}
+            </select>
+          </F>
           <F label="Area"><input value={h.area} onChange={(e) => set("area", e.target.value)} /></F>
           <F label="Total for stay"><Num value={h.total} onChange={(v) => set("total", v)} /></F>
           <F label="Currency"><CurSelect value={h.currency} onChange={(v) => set("currency", v)} /></F>
@@ -1954,7 +2103,7 @@ function TransferCard({ x, trip, st, open, setOpen, updTrip }) {
         <button className="btn btn-quiet" aria-expanded={open} aria-label="Edit details" onClick={() => setOpen(!open)}>
           {open ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
         </button>
-        <div className="min-w-0 flex-1">
+        <div className="min-w-0 flex-1 basis-48">
           <div className="font-semibold">{transferTitle(x)}</div>
           <div className="flex flex-wrap gap-1 mt-1">
             <span className="chip">{TRANSFER_MODES[x.mode][0]}</span>
@@ -1965,7 +2114,7 @@ function TransferCard({ x, trip, st, open, setOpen, updTrip }) {
           </div>
           {!open && x.notes && <p className="text-sm muted mt-1">{x.notes}</p>}
         </div>
-        <div className="text-right num">
+        <div className="text-right num shrink-0 ml-auto">
           <div className="font-bold">{cost === null ? <span className="muted font-normal">No cost yet</span> : money(cost, st)}</div>
           {cost !== null && <div className="text-xs muted">{money(cost, st, st.secondaryCurrency)}</div>}
         </div>
@@ -2108,7 +2257,7 @@ function OverlandCard({ x, trip, st, people, open, setOpen, updTrip }) {
         <button className="btn btn-quiet" aria-expanded={open} aria-label="Edit details" onClick={() => setOpen(!open)}>
           {open ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
         </button>
-        <div className="min-w-0 flex-1">
+        <div className="min-w-0 flex-1 basis-48">
           <div className="font-semibold flex items-center gap-1.5">
             <Icon size={15} aria-hidden="true" /> {x.from || "?"} → {x.to || "?"}
             {x.source === "email" && <span className="chip chip-info ml-1">From email</span>}
@@ -2121,7 +2270,7 @@ function OverlandCard({ x, trip, st, people, open, setOpen, updTrip }) {
           </div>
           {!open && x.notes && <p className="text-sm muted mt-1">{x.notes}</p>}
         </div>
-        <div className="text-right num">
+        <div className="text-right num shrink-0 ml-auto">
           <div className="font-bold">{usd === null ? <span className="muted font-normal">No price yet</span> : money(usd, st)}</div>
           {usd !== null && <div className="text-xs muted">{x.per === "person" ? `${money(toUSD(x.price, x.currency, st), st)} pp × ${pax}` : money(usd, st, st.secondaryCurrency)}</div>}
         </div>
@@ -2248,23 +2397,46 @@ function priceIn(amount, cur) {
   return { value: null, currency: "USD", note: `Charged ${n.toLocaleString("en-US")} ${c || "(currency not stated)"}, which the app doesn't convert` };
 }
 
-function destFor(trip, start, end, ...names) {
+// Folds accents and German spellings so "Göttingen", "Goettingen" and
+// "Gottingen" all compare equal.
+const placeKey = (s) => (s || "").toLowerCase().replace(/ß/g, "ss").normalize("NFD").replace(/[̀-ͯ]/g, "")
+  .replace(/ae/g, "a").replace(/oe/g, "o").replace(/ue/g, "u").replace(/[^a-z0-9]+/g, " ").trim();
+
+// The destination a place name points at: "Frankfurt am Main" → Frankfurt.
+// Only an unambiguous match counts.
+function destByName(ds, ...names) {
+  const hay = ` ${names.filter(Boolean).map(placeKey).join(" ")} `;
+  if (!hay.trim()) return null;
+  const hits = ds.filter((d) => { const k = placeKey(d.name); return k.length >= 3 && hay.includes(` ${k} `); });
+  return hits.length === 1 ? hits[0] : null;
+}
+
+// The destination whose dates a stay overlaps most, or that it starts in.
+function destByDates(ds, start, end) {
+  if (!validD(start)) return null;
+  const s = parseD(start);
+  const e = validD(end) ? parseD(end) : s + DAY;
+  let best = null, bestOverlap = 0;
+  ds.forEach((d) => {
+    if (!validD(d.start) || !validD(d.end)) return;
+    const o = Math.min(e, parseD(d.end)) - Math.max(s, parseD(d.start));
+    if (o > bestOverlap) { bestOverlap = o; best = d; }
+  });
+  return best || ds.find((d) => validD(d.start) && validD(d.end) && s >= parseD(d.start) && s <= parseD(d.end)) || null;
+}
+
+// Where a booking belongs: the city it names first (so a booking isn't filed
+// under whatever destination happens to span its dates), then its dates,
+// then the hotel's own name.
+function destFor(trip, start, end, city, area, address, name) {
   const ds = trip.destinations;
+  const byCity = destByName(ds, city, area, address);
+  if (byCity) return byCity;
   if (validD(start)) {
-    const s = parseD(start);
-    const e = validD(end) ? parseD(end) : s + DAY;
-    let best = null, bestOverlap = 0;
-    ds.forEach((d) => {
-      if (!validD(d.start) || !validD(d.end)) return;
-      const o = Math.min(e, parseD(d.end)) - Math.max(s, parseD(d.start));
-      if (o > bestOverlap) { bestOverlap = o; best = d; }
-    });
-    if (best) return best;
-    const on = ds.find((d) => validD(d.start) && validD(d.end) && s >= parseD(d.start) && s <= parseD(d.end));
-    if (on) return on;
+    const byDates = destByDates(ds, start, end);
+    if (byDates) return byDates;
   }
-  const hay = names.filter(Boolean).join(" ").toLowerCase();
-  return ds.find((d) => d.name && hay.includes(d.name.toLowerCase())) || ds[0] || null;
+  return destByName(ds, name) || ds[0] || null;
 }
 
 // Turns the model's answer into a reviewable list of changes to this trip.
